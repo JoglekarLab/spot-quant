@@ -1,0 +1,10 @@
+napari
+scikit-image
+scipy
+numpy
+pandas
+nd2
+tifffile
+openpyxl
+qtpy
+# Optional: ilastik + xarray are only needed for the ilastik threshold option

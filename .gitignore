@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+.vscode/
+
+# Data & generated outputs (not source)
+*.xlsx
+*.nd2
+*.tif
+*.tiff
+*.ilp
+*.pickle
