@@ -1,9 +1,29 @@
-# Spot Quant — detection basics
+# Spot Quant — interactive fluorescent spot quantification
+
+A napari GUI for detecting and measuring fluorescent spots in
+microscopy images (tif / tiff / nd2).
+
+## Run
+
+```bash
+conda activate img-env
+python -m spot_quant
+```
+
+The GUI is a single dock widget with two tabs: **Files & detection** (file IO
+and the detection controls together) and **Measurement**.
+
+## Panels
+
+**File IO**
+- *Select folder…* lists every `.tif`, `.tiff` and `.nd2` file in a folder.
+- Double-click a file to open it.
+- Start selecting the areas of interest where you want to measure the intensity of your spots and perform linesman's
 
 ## Pipeline
 
 Draw ROIs, tune smoothing → white top-hat → thresholding on a live single-plane
-preview, then press **Detect spots** to run the full z-stack (find maxima → link
+preview, then press **Detect spots** to detect all spots (find maxima → link
 across z → measure in every channel).
 
 ![Spot Quant detection pipeline](detection_flowchart.png)
@@ -16,7 +36,7 @@ method and size; the preview updates live.
 - **Median** (default) — removes hot pixels and outliers, keeps spots sharp.
 - **Gaussian** — smooths gentle noise, but blurs spots and only smears hot pixels.
 - **Kuwahara** — preserves edges, but can look blocky and lower peak brightness.
-- **Gaussian low-pass** — very smooth, but softens spots (here a *bigger* size = *less* blur).
+- **Gaussian low-pass** — very smooth, but softens spots.
 
 ![Smoothing methods compared](smoothing_demo.png)
 
