@@ -1,35 +1,4 @@
-# Spot Quant — interactive fluorescent spot quantification
-
-A modular napari GUI for detecting and measuring fluorescent spots in
-microscopy images (tif / tiff / nd2).
-
-## Run
-
-```bash
-conda activate img-env
-python -m spot_quant
-```
-
-The GUI is a single dock widget with two tabs: **Files & detection** (file IO
-and the detection controls together) and **Measurement**.
-
-## Panels
-
-**File IO**
-- *Select folder…* lists every `.tif`, `.tiff` and `.nd2` file in a folder.
-- Double-click a file to open it. The transmitted / brightfield / phase
-  channel is shown in grayscale as the **bottom** layer; fluorescence channels
-  sit on top as coloured additive layers. The **reference** channel's contrast
-  is set to [min, 0.7·max] and other fluorescence channels to [min, 0.8·max].
-  (The white top-hat result is no longer displayed as a layer.)
-- *Edit image metadata…* reads channel names, pixel size, magnification,
-  time step and **z-step** from the file where available and lets you edit them
-  (defaults are used when a value is missing).
-- If a z-stack's file has no z-step / time metadata, opening it **prompts** for
-  the z-step (in nanometres) or time interval so downstream defaults are set
-  correctly.
-
-**Spot detection** (same tab as File IO)
+**Spot detection**
 Each algorithm stage is its own control group. Global detection is disabled:
 preview spots appear **only inside the ROIs** once they are drawn. Tuning a
 control updates the live ROI-limited single-plane preview, which draws the
