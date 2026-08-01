@@ -26,10 +26,9 @@ Draw ROIs, tune smoothing → white top-hat → thresholding on a live single-pl
 preview, then press **Detect spots** to detect all spots (find maxima → link
 across z → measure in every channel).
 
-<div align="center">
-  ![Spot Quant detection pipeline](detection_flowchart.svg)
-</div>
-
+<p align="center">
+  <img src="detection_flowchart.svg" alt="Spot Quant detection pipeline" width="380">
+</p>
 
 ## Smoothing
 
