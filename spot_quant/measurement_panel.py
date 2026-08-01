@@ -10,13 +10,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import napari.utils.notifications as notifications
+import pandas as pd
 from qtpy.QtWidgets import (
     QAbstractItemView, QCheckBox, QFileDialog, QGroupBox, QHBoxLayout, QLabel,
     QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
     QWidget,
 )
 
-from . import pipeline, scan
+from . import pipeline, scan, session_io
 from .state import AppState
 
 
@@ -41,19 +42,17 @@ class MeasurementPanel(QWidget):
         layout.addWidget(self.table, 1)
 
         btn_row = QHBoxLayout()
-        self.export_csv_btn = QPushButton("Export CSV…")
         self.export_xlsx_btn = QPushButton("Export XLSX…")
         self.clear_btn = QPushButton("Clear session")
-        self.export_csv_btn.clicked.connect(lambda: self._export("csv"))
         self.export_xlsx_btn.clicked.connect(lambda: self._export("xlsx"))
         self.clear_btn.clicked.connect(self.state.clear_session)
-        btn_row.addWidget(self.export_csv_btn)
         btn_row.addWidget(self.export_xlsx_btn)
         btn_row.addWidget(self.clear_btn)
         layout.addLayout(btn_row)
 
         self.linescan_check = QCheckBox(
             "Also export line-scans (two-spot ROIs) → *_linescans.xlsx")
+        self.linescan_check.setChecked(True)
         layout.addWidget(self.linescan_check)
 
         self.state.result_updated.connect(self._refresh)
@@ -139,16 +138,41 @@ class MeasurementPanel(QWidget):
             self, "Export compiled measurements", default, filt)
         if not path:
             return
+        # Resume tables: exact ROIs (incl. empty ones + polygons) and settings,
+        # so the session can be re-imported to add more ROIs later.
+        roi_df = session_io.rois_dataframe(self.state.session_shapes,
+                                           self.state.session_ref)
+        settings_df = session_io.settings_dataframe(
+            self.state.params, getattr(self.state, "roi_counter", 0))
+        companion = str(Path(path).with_suffix("")) + "_session.xlsx"
         try:
             if fmt == "xlsx":
-                df.to_excel(path, index=False)
+                with pd.ExcelWriter(path) as writer:
+                    df.to_excel(writer, sheet_name="measurements", index=False)
+                    if not roi_df.empty:
+                        roi_df.to_excel(writer, sheet_name=session_io.ROI_SHEET,
+                                        index=False)
+                        settings_df.to_excel(
+                            writer, sheet_name=session_io.SETTINGS_SHEET,
+                            index=False)
             else:
                 df.to_csv(path, index=False)
+                if not roi_df.empty:
+                    with pd.ExcelWriter(companion) as writer:
+                        roi_df.to_excel(writer, sheet_name=session_io.ROI_SHEET,
+                                        index=False)
+                        settings_df.to_excel(
+                            writer, sheet_name=session_io.SETTINGS_SHEET,
+                            index=False)
         except Exception as exc:  # noqa: BLE001
             notifications.show_error(f"Export failed: {exc}")
             return
         msg = (f"Saved {len(df)} rows from {len(self.state.session_records)} "
                f"file(s) to {Path(path).name}")
+        if not roi_df.empty:
+            msg += ("; ROIs+settings sheets included (re-importable)"
+                    if fmt == "xlsx"
+                    else f"; ROIs → {Path(companion).name} (re-importable)")
 
         # Line-scan analysis -> separate *_linescans.xlsx with labelled sheets.
         if do_linescan:

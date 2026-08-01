@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from skimage.draw import polygon2mask
 from skimage.feature import peak_local_max
 from skimage.filters import threshold_li, threshold_otsu
 from skimage.morphology import remove_small_objects
@@ -35,6 +36,63 @@ THRESHOLD_METHODS = ("Otsu", "Li", "ilastik")
 
 # An ROI is (row_min, row_max, col_min, col_max, label).
 ROI = Tuple[int, int, int, int, str]
+
+
+# --------------------------------------------------------------------------- #
+# ROI geometry: rectangles (bounding box) and polygons (mask)
+# --------------------------------------------------------------------------- #
+def roi_mask(bounds, verts, plane_shape) -> np.ndarray:
+    """Boolean ``(Y, X)`` mask for one ROI.
+
+    ``verts`` is an ``(N, 2)`` array of ``(row, col)`` polygon corners, or
+    ``None`` for a plain rectangle given by ``bounds = (r0, r1, c0, c1)``.
+    Rectangles keep the exact bounding-box behaviour used elsewhere; polygons
+    are rasterised with :func:`skimage.draw.polygon2mask`.
+    """
+    if verts is None:
+        r0, r1 = int(min(bounds[0], bounds[1])), int(max(bounds[0], bounds[1]))
+        c0, c1 = int(min(bounds[2], bounds[3])), int(max(bounds[2], bounds[3]))
+        r0, r1 = max(0, r0), min(plane_shape[0], r1)
+        c0, c1 = max(0, c0), min(plane_shape[1], c1)
+        m = np.zeros(plane_shape, dtype=bool)
+        if r1 > r0 and c1 > c0:
+            m[r0:r1, c0:c1] = True
+        return m
+    return polygon2mask(plane_shape, np.asarray(verts, dtype=float))
+
+
+def shape_key(bounds, verts):
+    """Stable identity for an ROI: its bounding box plus, for a polygon, its
+    rounded corners.  Two polygons that share a bounding box stay distinct, so
+    ROIs are never merged by accident.
+    """
+    b = tuple(int(x) for x in bounds[:4])
+    if verts is None:
+        return (b, None)
+    v = np.asarray(verts, dtype=float)[:, -2:]
+    return (b, tuple((round(float(r), 1), round(float(c), 1)) for r, c in v))
+
+
+def is_axis_rect(verts, tol: float = 1.0) -> bool:
+    """True if four corners form an axis-aligned rectangle within ``tol`` px.
+
+    A shape drawn as a rectangle but dragged into a trapezoid, or a rotated
+    rectangle, fails this test.  Used to reject "rectangles" that are no longer
+    rectangular instead of silently boxing them.
+    """
+    v = np.asarray(verts, dtype=float)
+    if v.ndim != 2 or v.shape[0] != 4:
+        return False
+    rs, cs = v[:, 0], v[:, 1]
+    r0, r1, c0, c1 = rs.min(), rs.max(), cs.min(), cs.max()
+    if (r1 - r0) <= tol or (c1 - c0) <= tol:
+        return False
+    for r, c in v:
+        near_r = min(abs(r - r0), abs(r - r1)) <= tol
+        near_c = min(abs(c - c0), abs(c - c1)) <= tol
+        if not (near_r and near_c):
+            return False
+    return True
 
 
 @dataclass
@@ -183,7 +241,7 @@ def _disk_ring_masks(shape, r, c, radius, gap, width):
 
 
 def measure_spot(raw: np.ndarray, foreground: np.ndarray, r: int, c: int,
-                 params: PipelineParams) -> dict:
+                 params: PipelineParams, full_disk: bool = False) -> dict:
     """Intensity stats + local-ring background for one spot.
 
     Signal pixels are the thresholded foreground pixels within the spot disk;
@@ -191,10 +249,15 @@ def measure_spot(raw: np.ndarray, foreground: np.ndarray, r: int, c: int,
     the *raw* image.  Background is the ring median times the spot pixel count,
     giving a contribution directly comparable to the integrated spot
     intensity.  (Mirrors memQuant's signal/background logic.)
+
+    ``full_disk`` uses the whole disk as signal (ignoring the foreground mask).
+    Used for manually placed spots, which are typically ones detection missed
+    because they sit below the threshold, so ``disk & foreground`` would be
+    empty.
     """
     disk, ring = _disk_ring_masks(raw.shape, r, c, params.measure_radius,
                                   params.bkg_gap, params.bkg_width)
-    signal_mask = disk & foreground
+    signal_mask = disk if full_disk else (disk & foreground)
     bkg_mask = ring & ~foreground
     spot_vals = raw[signal_mask]
     ring_vals = raw[bkg_mask]
@@ -287,7 +350,8 @@ def _clip_roi(roi: ROI, shape) -> ROI:
 
 
 def global_roi_threshold(tophat: np.ndarray, params: PipelineParams,
-                         rois: Optional[List[ROI]]) -> Optional[float]:
+                         rois: Optional[List[ROI]],
+                         masks: Optional[dict] = None) -> Optional[float]:
     """One threshold from the pixels pooled across *all* ROIs.
 
     Compiles a single intensity histogram from the top-hat values inside every
@@ -301,6 +365,12 @@ def global_roi_threshold(tophat: np.ndarray, params: PipelineParams,
     plane_shape = tophat.shape[1:]
     pooled = []
     for roi in (rois or []):
+        label = roi[4]
+        if masks and label in masks:
+            m = masks[label]
+            if m.any():
+                pooled.append(tophat[:, m].ravel())
+            continue
         r0, r1, c0, c1, _ = _clip_roi(roi, plane_shape)
         if r1 <= r0 or c1 <= c0:
             continue
@@ -314,7 +384,8 @@ def compute_foreground_stack(tophat: np.ndarray, raw_stack: np.ndarray,
                              params: PipelineParams,
                              rois: Optional[List[ROI]] = None,
                              threshold: Optional[float] = None,
-                             threshold_rois: Optional[List[ROI]] = None
+                             threshold_rois: Optional[List[ROI]] = None,
+                             masks: Optional[dict] = None
                              ) -> np.ndarray:
     """(Z, Y, X) boolean foreground.
 
@@ -332,6 +403,11 @@ def compute_foreground_stack(tophat: np.ndarray, raw_stack: np.ndarray,
             ilastik_fg = np.stack([_ilastik_foreground(raw_stack[z], params)
                                    for z in range(raw_stack.shape[0])])
             for roi in rois:
+                label = roi[4]
+                if masks and label in masks:
+                    m = masks[label]
+                    fg[:, m] = ilastik_fg[:, m]
+                    continue
                 r0, r1, c0, c1, _ = _clip_roi(roi, plane_shape)
                 if r1 > r0 and c1 > c0:
                     fg[:, r0:r1, c0:c1] = ilastik_fg[:, r0:r1, c0:c1]
@@ -339,9 +415,15 @@ def compute_foreground_stack(tophat: np.ndarray, raw_stack: np.ndarray,
 
         gt = threshold
         if gt is None:
-            gt = global_roi_threshold(tophat, params, threshold_rois or rois)
+            gt = global_roi_threshold(tophat, params, threshold_rois or rois,
+                                      masks)
         if gt is not None:
             for roi in rois:
+                label = roi[4]
+                if masks and label in masks:
+                    m = masks[label]
+                    fg[:, m] = tophat[:, m] > gt
+                    continue
                 r0, r1, c0, c1, _ = _clip_roi(roi, plane_shape)
                 if r1 > r0 and c1 > c0:
                     fg[:, r0:r1, c0:c1] = tophat[:, r0:r1, c0:c1] > gt
@@ -357,11 +439,19 @@ def compute_foreground_stack(tophat: np.ndarray, raw_stack: np.ndarray,
     return _filter_small(fg, params.min_mask_size)
 
 
-def _assign_region(r: int, c: int, rois: Optional[List[ROI]]) -> str:
+def _assign_region(r: int, c: int, rois: Optional[List[ROI]],
+                   masks: Optional[dict] = None) -> str:
     for roi in (rois or []):
-        r0, r1, c0, c1, label = roi
+        label = roi[4]
+        if masks and label in masks:
+            m = masks[label]
+            if 0 <= int(r) < m.shape[0] and 0 <= int(c) < m.shape[1] \
+                    and m[int(r), int(c)]:
+                return label
+            continue
+        r0, r1, c0, c1, lbl = roi
         if min(r0, r1) <= r < max(r0, r1) and min(c0, c1) <= c < max(c0, c1):
-            return label
+            return lbl
     return "global"
 
 
@@ -531,7 +621,8 @@ def run_stack(stack: np.ndarray, params: PipelineParams,
               pixel_size: float = 1.0, pixel_unit: str = "px",
               rois: Optional[List[ROI]] = None,
               threshold_rois: Optional[List[ROI]] = None,
-              threshold: Optional[float] = None) -> StackResult:
+              threshold: Optional[float] = None,
+              masks: Optional[dict] = None) -> StackResult:
     """Full-stack detection with cross-plane linking and in-focus measurement.
 
     Spots are detected within *rois*.  The threshold is *threshold* if given
@@ -549,12 +640,13 @@ def run_stack(stack: np.ndarray, params: PipelineParams,
     # One global threshold (explicit, or pooled across all ROIs).
     if rois:
         gt = (threshold if threshold is not None
-              else global_roi_threshold(tophat, params, threshold_rois or rois))
+              else global_roi_threshold(tophat, params, threshold_rois or rois,
+                                        masks))
     else:
         gt = threshold
     thresholds = {roi[4]: gt for roi in (rois or [])}
     foreground = compute_foreground_stack(tophat, stack, params, rois,
-                                          threshold=gt)
+                                          threshold=gt, masks=masks)
 
     # Detect per plane and tag each detection with a peak intensity.
     dets_by_plane: List[List[tuple]] = []
@@ -578,7 +670,7 @@ def run_stack(stack: np.ndarray, params: PipelineParams,
         if len(tr) < min_link:                     # spurious detection
             continue
         z, r, c, _ = max(tr, key=lambda t: t[3])   # in-focus = max intensity
-        region = _assign_region(r, c, rois)
+        region = _assign_region(r, c, rois, masks)
         # Drop spots whose disk touches the boundary of their ROI.
         if _touches_boundary(r, c, params.measure_radius,
                              _roi_bounds(region, rois)):
@@ -616,7 +708,8 @@ def run_stack(stack: np.ndarray, params: PipelineParams,
 def _channel_foreground(stack: np.ndarray, params: PipelineParams,
                         rois: Optional[List[ROI]],
                         threshold_rois: Optional[List[ROI]] = None,
-                        threshold: Optional[float] = None):
+                        threshold: Optional[float] = None,
+                        masks: Optional[dict] = None):
     """Per-plane top-hat + global-ROI-thresholded foreground for one channel."""
     stack = np.asarray(stack, dtype=float)
     if stack.ndim == 2:
@@ -624,19 +717,68 @@ def _channel_foreground(stack: np.ndarray, params: PipelineParams,
     tophat = _stack_tophat(stack, params)
     if rois:
         gt = (threshold if threshold is not None
-              else global_roi_threshold(tophat, params, threshold_rois or rois))
+              else global_roi_threshold(tophat, params, threshold_rois or rois,
+                                        masks))
     else:
         gt = threshold
     thr = {roi[4]: gt for roi in (rois or [])}
-    fg = compute_foreground_stack(tophat, stack, params, rois, threshold=gt)
+    fg = compute_foreground_stack(tophat, stack, params, rois, threshold=gt,
+                                  masks=masks)
     return stack, fg, thr
+
+
+def _manual_measure(manual_spots: dict, ref_channel: str, ch_data: dict,
+                    ch_thr: dict, params: PipelineParams,
+                    pixel_size: float, pixel_unit: str,
+                    columns: list, start_id: int) -> pd.DataFrame:
+    """Measure user-placed spots across all channels (full-disk signal).
+
+    ``manual_spots`` maps region label -> list of ``(row, col)``.  ``ch_data``
+    maps channel -> ``(float_stack, foreground)``.  In-focus z is taken from the
+    reference channel; non-reference channels get the chromatic offset.  Manual
+    rows are marked by ``n_planes_linked == 0``.
+    """
+    ref_stack, _ = ch_data[ref_channel]
+    Zr = ref_stack.shape[0]
+    radius = params.measure_radius
+    dz, dy, dx = params.offset_z, params.offset_y, params.offset_x
+    rows, sid = [], start_id
+    for region, pts in (manual_spots or {}).items():
+        for r, c in pts:
+            r, c = int(round(r)), int(round(c))
+            z = int(np.argmax([_disk_peak(ref_stack[k], r, c, radius)
+                               for k in range(Zr)]))
+            for name, (stack, fg) in ch_data.items():
+                Z, H, W = stack.shape
+                if name == ref_channel:
+                    zz, rr, cc = z, r, c
+                else:
+                    zz = int(np.clip(z + dz, 0, Z - 1))
+                    rr = int(np.clip(r + dy, 0, H - 1))
+                    cc = int(np.clip(c + dx, 0, W - 1))
+                stats = measure_spot(stack[zz], fg[zz], rr, cc, params,
+                                     full_disk=True)
+                rows.append({
+                    "spot_id": sid, "channel": name,
+                    "z_plane": zz, "row_px": rr, "col_px": cc,
+                    f"x_{pixel_unit}": cc * pixel_size,
+                    f"y_{pixel_unit}": rr * pixel_size,
+                    **stats,
+                    "region": region,
+                    "roi_threshold": ch_thr.get(name, {}).get(region),
+                    "n_planes_linked": 0,
+                })
+            sid += 1
+    return pd.DataFrame(rows, columns=columns)
 
 
 def run_multichannel(stacks: dict, ref_channel: str, params: PipelineParams,
                      pixel_size: float = 1.0, pixel_unit: str = "px",
                      rois: Optional[List[ROI]] = None,
                      threshold_rois: Optional[List[ROI]] = None,
-                     channel_thresholds: Optional[dict] = None
+                     channel_thresholds: Optional[dict] = None,
+                     masks: Optional[dict] = None,
+                     manual_spots: Optional[dict] = None
                      ) -> MultiChannelResult:
     """Detect spots in the reference channel only; measure all channels there.
 
@@ -660,7 +802,7 @@ def run_multichannel(stacks: dict, ref_channel: str, params: PipelineParams,
     ref_thresh = channel_thresholds.get(ref_channel) if channel_thresholds else None
     ref_res = run_stack(measurable[ref_channel], params,
                         pixel_size, pixel_unit, rois, threshold_rois,
-                        threshold=ref_thresh)
+                        threshold=ref_thresh, masks=masks)
     ref_df = ref_res.measurements.copy()
     ref_df.insert(1, "channel", ref_channel)
     columns = list(ref_df.columns)
@@ -669,13 +811,23 @@ def run_multichannel(stacks: dict, ref_channel: str, params: PipelineParams,
     thresholds = {ref_channel: ref_res.roi_thresholds}
     frames = [ref_df]
 
+    # Stash each channel's float stack + foreground for measuring manual spots.
+    ref_float = np.asarray(measurable[ref_channel], dtype=float)
+    if ref_float.ndim == 2:
+        ref_float = ref_float[None]
+    ch_data = {ref_channel: (ref_float, ref_res.foreground)}
+    ch_thr = {ref_channel: ref_res.roi_thresholds}
+
     dz, dy, dx = params.offset_z, params.offset_y, params.offset_x
     for name, stack in measurable.items():
         if name == ref_channel:
             continue
         ch_thresh = channel_thresholds.get(name) if channel_thresholds else None
         ch_stack, fg, thr = _channel_foreground(stack, params, rois,
-                                                threshold_rois, threshold=ch_thresh)
+                                                threshold_rois,
+                                                threshold=ch_thresh, masks=masks)
+        ch_data[name] = (ch_stack, fg)
+        ch_thr[name] = thr
         Z, H, W = ch_stack.shape
         rows = []
         for _, rs in ref_res.measurements.iterrows():
@@ -695,6 +847,14 @@ def run_multichannel(stacks: dict, ref_channel: str, params: PipelineParams,
         frames.append(pd.DataFrame(rows, columns=columns))
         per_channel[name] = thr
         thresholds[name] = thr
+
+    if manual_spots:
+        start_id = (int(ref_res.measurements["spot_id"].max()) + 1
+                    if len(ref_res.measurements) else 0)
+        man = _manual_measure(manual_spots, ref_channel, ch_data, ch_thr,
+                              params, pixel_size, pixel_unit, columns, start_id)
+        if len(man):
+            frames.append(man)
 
     combined = sort_by_roi(pd.concat(frames, ignore_index=True),
                            extra=["channel", "spot_id"])
@@ -719,12 +879,19 @@ def compute_session_thresholds(files_data: list, params: PipelineParams) -> dict
     from collections import defaultdict
     pooled = defaultdict(list)
     for f in files_data:
+        masks = f.get("masks")
         for ch, stack in f["stacks"].items():
             if not is_measurable_channel(ch):
                 continue
             tophat = _stack_tophat(stack, params)
             ps = tophat.shape[1:]
             for roi in f.get("rois", []):
+                label = roi[4]
+                if masks and label in masks:
+                    m = masks[label]
+                    if m.any():
+                        pooled[ch].append(tophat[:, m].ravel())
+                    continue
                 r0, r1, c0, c1, _ = _clip_roi(roi, ps)
                 if r1 > r0 and c1 > c0:
                     pooled[ch].append(tophat[:, r0:r1, c0:c1].ravel())
@@ -749,7 +916,8 @@ def run_session(files_data: list, params: PipelineParams):
             f["stacks"], f["ref_channel"], params,
             pixel_size=f.get("pixel_size", 1.0),
             pixel_unit=f.get("pixel_unit", "px"),
-            rois=f["rois"], channel_thresholds=thresholds)
+            rois=f["rois"], channel_thresholds=thresholds,
+            masks=f.get("masks"), manual_spots=f.get("manual_spots"))
         frames.append(tag_filename(res.measurements, f["filename"]))
     if not frames:
         return pd.DataFrame(), thresholds
@@ -763,20 +931,27 @@ def run_session(files_data: list, params: PipelineParams):
 
 def run_preview(stack: np.ndarray, z: int, params: PipelineParams,
                 rois: Optional[List[ROI]] = None,
-                threshold_rois: Optional[List[ROI]] = None) -> PipelineResult:
-    """ROI-limited single-plane preview for the displayed Z-plane.
+                threshold_rois: Optional[List[ROI]] = None,
+                masks: Optional[dict] = None,
+                project: bool = False) -> PipelineResult:
+    """ROI-limited single-plane preview for the displayed image.
 
     Spots are found only inside the ROIs, using one global threshold pooled
     across all *threshold_rois* (default: all *rois*) stack histograms, matching
-    :func:`run_stack`.  The current plane is displayed; the foreground and
-    detected maxima are confined to the ROIs.
+    :func:`run_stack`.  The foreground and detected maxima are confined to the
+    ROIs.
+
+    The displayed image is the Z-plane *z* by default, or the **max projection**
+    over Z when *project* is set (used when the viewer shows the stack
+    flattened).  Either way the threshold is still pooled from the whole stack,
+    so the preview outline is consistent with the full-stack detection.
     """
     stack = np.asarray(stack, dtype=float)
     if stack.ndim == 2:
         stack = stack[None]
     Z = stack.shape[0]
     z = max(0, min(int(z), Z - 1))
-    plane = stack[z]
+    plane = stack.max(axis=0) if project else stack[z]
 
     # Current-plane top-hat for display.
     th_full = filters.white_tophat(
@@ -789,6 +964,11 @@ def run_preview(stack: np.ndarray, z: int, params: PipelineParams,
     if method == "ilastik":
         fgi = _ilastik_foreground(plane, params)
         for roi in (rois or []):
+            label = roi[4]
+            if masks and label in masks:
+                m = masks[label]
+                fg[m] = fgi[m]
+                continue
             r0, r1, c0, c1, _ = _clip_roi(roi, plane.shape)
             if r1 > r0 and c1 > c0:
                 fg[r0:r1, c0:c1] = fgi[r0:r1, c0:c1]
@@ -797,19 +977,31 @@ def run_preview(stack: np.ndarray, z: int, params: PipelineParams,
         # One global threshold from all ROIs' stack histograms (pooled).
         pooled = []
         for roi in (threshold_rois or rois or []):
+            label = roi[4]
             r0, r1, c0, c1, _ = _clip_roi(roi, plane.shape)
             if r1 <= r0 or c1 <= c0:
                 continue
             sub = stack[:, r0:r1, c0:c1]
-            pooled.append(np.stack([
+            th_sub = np.stack([
                 filters.white_tophat(
                     filters.smooth(sub[k], params.smoothing_method,
                                    params.smoothing_size), params.tophat_size)
-                for k in range(Z)]).ravel())
+                for k in range(Z)])
+            if masks and label in masks:
+                m_sub = masks[label][r0:r1, c0:c1]
+                if m_sub.any():
+                    pooled.append(th_sub[:, m_sub].ravel())
+            else:
+                pooled.append(th_sub.ravel())
         gt = _threshold_value(np.concatenate(pooled), method) if pooled else None
         thresholds = {roi[4]: gt for roi in (rois or [])}
         if gt is not None:
             for roi in (rois or []):
+                label = roi[4]
+                if masks and label in masks:
+                    m = masks[label]
+                    fg[m] = th_full[m] > gt
+                    continue
                 r0, r1, c0, c1, _ = _clip_roi(roi, plane.shape)
                 if r1 > r0 and c1 > c0:
                     fg[r0:r1, c0:c1] = th_full[r0:r1, c0:c1] > gt

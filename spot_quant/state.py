@@ -22,6 +22,7 @@ class AppState(QObject):
     metadata_changed = Signal()    # emitted after metadata is edited
     result_updated = Signal()      # emitted after the pipeline re-runs
     session_changed = Signal()     # emitted after the session table changes
+    session_imported = Signal()    # emitted after ROIs/settings are imported
 
     def __init__(self):
         super().__init__()
@@ -39,12 +40,22 @@ class AppState(QObject):
         # Keying by region lets incremental ROI detection add new regions and
         # re-detection replace a region without duplicating rows.
         self.session_records: "dict[str, dict[str, pd.DataFrame]]" = {}
+        # Manually placed spots, filename -> region label -> list of (row, col).
+        # Measured full-disk and merged into detection at record/export time.
+        self.manual_spots: "dict[str, dict[str, list]]" = {}
         # Number of ROIs drawn on the current image but not yet analyzed.
         self.pending_rois: int = 0
         # Per-file ROIs as labelled tuples (r0,r1,c0,c1,label) + reference
         # channel, so the whole session can be re-run at export.  ROI labels
         # are session-global (increment across files, never repeat).
         self.session_rois: "dict[str, list]" = {}
+        # Full per-file ROI shape records: list of
+        # {"bounds": (r0,r1,c0,c1), "verts": ndarray|None, "label": str}.
+        # ``verts`` is None for rectangles and the polygon corners otherwise.
+        self.session_shapes: "dict[str, list]" = {}
+        # Per-file polygon corners keyed by label ({label: verts}); rectangles
+        # are absent.  Used to rebuild masks for the export re-run.
+        self.session_polys: "dict[str, dict]" = {}
         self.session_ref: "dict[str, str]" = {}
         self.roi_counter: int = 0
         # Latest detection parameters (set by the detection panel).
@@ -55,24 +66,49 @@ class AppState(QObject):
         self.offset_z: int = 0
         self.offset_y: int = 0
         self.offset_x: int = 0
+        # micro-sam cell segmentation for the current file: 2-D instance-label
+        # image, and the mom/bud role of each cell label ({label: "mom"/"bud"}).
+        self.cell_labels = None
+        self.cell_roles: "dict[int, str]" = {}
 
     # -- per-file ROI persistence ------------------------------------------- #
-    def assign_roi_labels(self, filename: str, bounds_list, ref_channel: str):
+    def assign_roi_labels(self, filename: str, shapes, ref_channel: str):
         """Store the file's ROIs with session-global labels and return them.
 
-        Labels already assigned to a rectangle (matched by bounds) are kept;
-        new rectangles get the next global ``ROIn``.  Returns the labelled list
-        ``[(r0, r1, c0, c1, label), ...]``.
+        ``shapes`` is a list of records
+        ``{"bounds": (r0,r1,c0,c1), "verts": ndarray|None, "key": hashable}``.
+        Labels already assigned to a shape (matched by its ``key``, which
+        includes polygon corners so two shapes with the same bounding box stay
+        distinct) are kept; new shapes get the next global ``ROIn``.  Returns
+        the labelled list ``[(r0, r1, c0, c1, label), ...]`` aligned with
+        ``shapes``.
         """
-        prior = {tuple(int(x) for x in r[:4]): r[4]
-                 for r in self.session_rois.get(filename, [])}
-        labelled, self.roi_counter = pipeline.next_roi_labels(
-            prior, bounds_list, self.roi_counter)
-        if labelled:
+        prior = {}
+        for rec in self.session_shapes.get(filename, []):
+            prior[pipeline.shape_key(rec["bounds"], rec.get("verts"))] = \
+                rec["label"]
+        labelled, records = [], []
+        for s in shapes:
+            key = s.get("key") or pipeline.shape_key(s["bounds"], s.get("verts"))
+            label = prior.get(key)
+            if label is None:
+                self.roi_counter += 1
+                label = f"ROI{self.roi_counter}"
+            r0, r1, c0, c1 = s["bounds"]
+            labelled.append((r0, r1, c0, c1, label))
+            records.append({"bounds": tuple(s["bounds"]),
+                            "verts": s.get("verts"), "label": label})
+        if records:
             self.session_rois[filename] = labelled
+            self.session_shapes[filename] = records
+            self.session_polys[filename] = {
+                r["label"]: r["verts"] for r in records
+                if r["verts"] is not None}
             self.session_ref[filename] = ref_channel
         else:
             self.session_rois.pop(filename, None)
+            self.session_shapes.pop(filename, None)
+            self.session_polys.pop(filename, None)
             self.session_ref.pop(filename, None)
         return labelled
 
@@ -97,9 +133,17 @@ class AppState(QObject):
                 (n for n in names if pipeline.is_measurable_channel(n)), names[0])
             # session_rois already stores (r0,r1,c0,c1,label) with global labels.
             rois = [tuple(r) for r in bounds]
+            # Rebuild polygon masks (keyed by label) from stored corners so the
+            # export re-run respects each ROI's real shape.
+            plane_shape = next(iter(stacks.values())).shape[1:]
+            polys = self.session_polys.get(fname, {})
+            masks = {label: pipeline.roi_mask(None, verts, plane_shape)
+                     for label, verts in polys.items() if verts is not None}
             files_data.append({
                 "filename": fname, "stacks": stacks, "ref_channel": ref,
-                "rois": rois, "pixel_size": meta.pixel_size,
+                "rois": rois, "masks": masks or None,
+                "manual_spots": self.manual_spots.get(fname) or None,
+                "pixel_size": meta.pixel_size,
                 "pixel_unit": meta.pixel_unit})
         return files_data
 
@@ -144,9 +188,35 @@ class AppState(QObject):
             del self.session_records[filename]
         self.session_changed.emit()
 
+    def import_session(self, data: dict):
+        """Load ROIs (and optionally settings) from an imported session.
+
+        ``data`` is the dict returned by ``session_io.session_from_sheets`` /
+        ``session_from_measurements``.  Replaces the per-file ROI state so that
+        opening a file shows its restored ROIs and new ROIs keep numbering.
+        Prior measurements aren't restored (the table repopulates when you
+        re-detect or export, which re-runs the whole session).
+        """
+        self.session_shapes = dict(data.get("session_shapes", {}))
+        self.session_rois = dict(data.get("session_rois", {}))
+        self.session_polys = dict(data.get("session_polys", {}))
+        self.session_ref = dict(data.get("session_ref", {}))
+        self.roi_counter = int(data.get("roi_counter", 0))
+        params = data.get("params")
+        if params is not None:
+            self.params = params
+            self.offset_z = int(getattr(params, "offset_z", 0))
+            self.offset_y = int(getattr(params, "offset_y", 0))
+            self.offset_x = int(getattr(params, "offset_x", 0))
+        self.session_imported.emit()
+        self.session_changed.emit()
+
     def clear_session(self):
         self.session_records.clear()
+        self.manual_spots.clear()
         self.session_rois.clear()
+        self.session_shapes.clear()
+        self.session_polys.clear()
         self.session_ref.clear()
         self.roi_counter = 0
         self.session_changed.emit()
@@ -192,4 +262,7 @@ class AppState(QObject):
         self.current_path = Path(path)
         self.image = image
         self.meta = meta
+        # Cell segmentation is per-file; drop it when a new file opens.
+        self.cell_labels = None
+        self.cell_roles = {}
         self.image_loaded.emit()

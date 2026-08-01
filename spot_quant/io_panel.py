@@ -5,13 +5,14 @@ from pathlib import Path
 
 import napari.utils.notifications as notifications
 import numpy as np
+import pandas as pd
 from qtpy.QtWidgets import (
     QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-    QGroupBox, QLabel, QLineEdit, QListWidget, QPushButton, QSpinBox,
-    QVBoxLayout, QWidget,
+    QGroupBox, QLabel, QLineEdit, QListWidget, QMessageBox, QPushButton,
+    QSpinBox, QVBoxLayout, QWidget,
 )
 
-from . import pipeline
+from . import pipeline, session_io
 from .metadata import list_image_files, load_image
 from .state import AppState
 
@@ -39,6 +40,9 @@ class FileIOPanel(QWidget):
         self.meta_btn.setEnabled(False)
         self.meta_btn.clicked.connect(self._edit_metadata)
 
+        self.import_btn = QPushButton("Import ROIs / session…")
+        self.import_btn.clicked.connect(self._import_session)
+
         files_box = QGroupBox("Images (tif / tiff / nd2)")
         box_layout = QVBoxLayout(files_box)
         box_layout.addWidget(QLabel("Double-click a file to open it"))
@@ -48,6 +52,7 @@ class FileIOPanel(QWidget):
         layout.addWidget(self.folder_label)
         layout.addWidget(files_box)
         layout.addWidget(self.meta_btn)
+        layout.addWidget(self.import_btn)
         layout.addStretch(1)
 
     # ------------------------------------------------------------------ #
@@ -113,16 +118,23 @@ class FileIOPanel(QWidget):
         else:
             ref_i = fluor_idx[0] if fluor_idx else None
 
+        # Z-stacks are shown flattened as a **max projection** (display only);
+        # the full stack stays on ``state`` for detection/measurement.
+        def _project(data):
+            return data.max(axis=0) if data.ndim == 3 else data
+
         # Add transmitted / brightfield / phase FIRST so it sits at the bottom.
         for i in other_idx:
-            self.viewer.add_image(image[i], name=names[i], colormap="gray")
+            self.viewer.add_image(_project(image[i]), name=names[i],
+                                  colormap="gray")
 
         # Then fluorescence channels on top.
         for j, i in enumerate(fluor_idx):
-            data = image[i]
+            data = _project(image[i])
             lo, hi = float(np.min(data)), float(np.max(data))
-            # Reference channel -> [min, 0.7*max]; others -> [min, 0.8*max].
-            frac = 0.7 if i == ref_i else 0.8
+            # Auto-contrast upper limit: a low fraction of max so dim spots stay
+            # visible. Reference channel -> [min, 0.3*max]; others -> [min, 0.4*max].
+            frac = 0.3 if i == ref_i else 0.4
             hi_lim = frac * hi if hi > lo else lo + 1.0
             if hi_lim <= lo:
                 hi_lim = lo + 1.0
@@ -131,6 +143,59 @@ class FileIOPanel(QWidget):
                 blending="additive", contrast_limits=[lo, hi_lim])
 
     # ------------------------------------------------------------------ #
+    def _import_session(self):
+        """Load ROIs (and settings) from a previous export to resume work.
+
+        An XLSX with an 'ROIs' sheet restores exactly; a plain measurements CSV
+        (or an XLSX without that sheet) rebuilds approximate rectangles from the
+        spot positions and warns that it is lossy.
+        """
+        start = str(self.state.folder) if self.state.folder else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import ROIs / session", start,
+            "Session / measurements (*.xlsx *.csv)")
+        if not path:
+            return
+        try:
+            data, approx = self._read_session(path)
+        except Exception as exc:  # noqa: BLE001
+            notifications.show_error(f"Import failed: {exc}")
+            return
+        n_files = len([v for v in data.get("session_rois", {}).values() if v])
+        n_rois = sum(len(v) for v in data.get("session_rois", {}).values())
+        if n_rois == 0:
+            notifications.show_warning("No ROIs found to import.")
+            return
+        if approx:
+            QMessageBox.warning(
+                self, "Approximate import",
+                f"Rebuilt {n_rois} rectangular ROI(s) from spot positions in "
+                f"{n_files} file(s).\n\nThis is approximate: ROIs with no spots, "
+                "polygon shapes and the original detection settings could not "
+                "be recovered. Re-check the boxes before detecting.")
+        self.state.import_session(data)
+        notifications.show_info(
+            f"Imported {n_rois} ROI(s) across {n_files} file(s)"
+            + (" (approximate)" if approx else "")
+            + ". Open a file to see its ROIs.")
+
+    def _read_session(self, path):
+        """Return ``(session_dict, approx)`` for an xlsx/csv import."""
+        suffix = Path(path).suffix.lower()
+        if suffix in (".xlsx", ".xlsm"):
+            xls = pd.ExcelFile(path)
+            if session_io.ROI_SHEET in xls.sheet_names:
+                roi_df = xls.parse(session_io.ROI_SHEET)
+                settings_df = (xls.parse(session_io.SETTINGS_SHEET)
+                               if session_io.SETTINGS_SHEET in xls.sheet_names
+                               else None)
+                return session_io.session_from_sheets(
+                    roi_df, settings_df, pipeline.PipelineParams), False
+            df = xls.parse(xls.sheet_names[0])
+            return session_io.session_from_measurements(df), True
+        df = pd.read_csv(path)
+        return session_io.session_from_measurements(df), True
+
     def _edit_metadata(self):
         if self.state.image is None:
             return
