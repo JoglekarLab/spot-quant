@@ -144,7 +144,8 @@ class AppState(QObject):
                 "rois": rois, "masks": masks or None,
                 "manual_spots": self.manual_spots.get(fname) or None,
                 "pixel_size": meta.pixel_size,
-                "pixel_unit": meta.pixel_unit})
+                "pixel_unit": meta.pixel_unit,
+                "z_step": meta.z_step})
         return files_data
 
     def recompute_session(self, with_linescans: bool = False):

@@ -267,6 +267,21 @@ class DetectionPanel(QWidget):
         self.detect_btn = QPushButton("Detect spots (stack)")
         self.detect_btn.clicked.connect(self.detect)
         layout.addWidget(self.detect_btn)
+        redetect_row = QHBoxLayout()
+        self.redetect_btn = QPushButton("Re-detect this file")
+        self.redetect_btn.setToolTip(
+            "Local: re-run every ROI in the OPEN file with the current settings. "
+            "The threshold is pooled from this file's ROIs only.")
+        self.redetect_btn.clicked.connect(self._redetect_all)
+        self.redetect_global_btn = QPushButton("Re-detect all files (global)")
+        self.redetect_global_btn.setToolTip(
+            "Global: reload every file with ROIs and re-run them all with ONE "
+            "threshold per channel, pooled across every ROI of every file — so "
+            "all files share the same cutoff.")
+        self.redetect_global_btn.clicked.connect(self._redetect_global)
+        redetect_row.addWidget(self.redetect_btn)
+        redetect_row.addWidget(self.redetect_global_btn)
+        layout.addLayout(redetect_row)
         self.status_label = QLabel("No spots detected yet")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
@@ -876,6 +891,95 @@ class DetectionPanel(QWidget):
         finally:
             self._running = False
             self._reassert_draw_mode()
+
+    def _redetect_all(self, *args):
+        """Re-run every drawn ROI with the current settings, keeping the boxes.
+
+        Plain Detect is incremental (new ROIs only); this forgets the prior
+        analysis for the file, drops its stored measurements, then re-detects
+        every ROI so parameter changes take effect. Manual spots are re-applied.
+        """
+        fname = (self.state.current_path.name
+                 if self.state.current_path else None)
+        if self._analyzed:
+            self._reset_analysis()
+            if fname:
+                self.state.session_records.pop(fname, None)
+                self.state.session_changed.emit()
+        self.detect()
+        # Fold any manually placed spots back into the freshly re-run ROIs.
+        man = self.state.manual_spots.get(fname, {}) if fname else {}
+        if man:
+            for e in list(self._analyzed):
+                if man.get(e["label"]):
+                    self._remeasure_roi(e)
+
+    def _rebuild_analyzed_from_records(self, recs, ref):
+        """Rebuild the current file's analyzed ROIs from a measurement table."""
+        self._reset_analysis()
+        labelled = self._save_rois()
+        shapes = self._valid_shapes()
+        ref_rows = (recs[recs["channel"] == ref]
+                    if "channel" in recs.columns else recs)
+        for s, roi in zip(shapes, labelled):
+            label = roi[4]
+            sub = ref_rows[ref_rows["region"] == label]
+            pts = [(int(z), int(r), int(c)) for z, r, c in
+                   zip(sub["z_plane"], sub["row_px"], sub["col_px"])]
+            self._analyzed.append({
+                "key": s["key"], "bounds": tuple(roi[:4]),
+                "verts": s["verts"], "label": label,
+                "centroids": np.array(pts, dtype=int).reshape(-1, 3)})
+        self._rebuild_committed()
+
+    def _redetect_global(self, *args):
+        """Reload every file with ROIs and re-run them all with one global
+        threshold per channel, pooled across every ROI of every file."""
+        files_data = self.state._build_files_data()
+        if not files_data:
+            notifications.show_warning("No files with ROIs to re-detect.")
+            return
+        cur = (self.state.current_path.name
+               if self.state.current_path else None)
+        self._running = True
+        self.redetect_global_btn.setEnabled(False)
+        self.redetect_global_btn.setText("Re-detecting all files…")
+        try:
+            thresholds = pipeline.compute_session_thresholds(files_data,
+                                                             self.params)
+            for f in files_data:
+                res = pipeline.run_multichannel(
+                    f["stacks"], f["ref_channel"], self.params,
+                    pixel_size=f.get("pixel_size", 1.0),
+                    pixel_unit=f.get("pixel_unit", "px"),
+                    rois=f["rois"], channel_thresholds=thresholds,
+                    masks=f.get("masks"), manual_spots=f.get("manual_spots"))
+                recs = res.measurements.copy()
+                if "z_plane" in recs.columns and f.get("z_step"):
+                    recs["z_um"] = recs["z_plane"] * f["z_step"]
+                self.state.session_records.pop(f["filename"], None)
+                if not recs.empty:
+                    self.state.record_measurements(f["filename"], recs)
+                if f["filename"] == cur:
+                    self._rebuild_analyzed_from_records(recs, f["ref_channel"])
+        except Exception as exc:  # noqa: BLE001
+            notifications.show_error(f"Global re-detect failed: {exc}")
+            return
+        finally:
+            self._running = False
+            self.redetect_global_btn.setEnabled(True)
+            self.redetect_global_btn.setText("Re-detect all files (global)")
+        if self.state.cell_labels is not None:
+            for e in self._analyzed:
+                self._assign_roi(e)
+            self._recolor_cells()
+            self._annotate_spot_roles()
+        self.state.session_changed.emit()
+        self.state.result_updated.emit()
+        thr_txt = ", ".join(f"{k}={v:.3g}" for k, v in thresholds.items() if v)
+        notifications.show_info(
+            f"Re-detected {len(files_data)} file(s) with one global threshold "
+            f"per channel. {thr_txt}")
 
     # -- reference-anchored, multi-channel detection -------------------- #
     def detect(self, *args):
