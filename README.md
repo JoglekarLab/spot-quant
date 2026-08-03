@@ -13,6 +13,32 @@ python -m spot_quant
 The GUI is a single dock widget with two tabs: **Files & detection** (file IO
 and the detection controls together) and **Measurement**.
 
+## Mac Install
+
+Works on Apple Silicon (M1/M2/M3) and Intel. You only do steps 1–2 once.
+
+### 1. Install miniconda from anaconda.com
+
+### 2. Create the environment
+
+```bash
+conda create -n img-env -c conda-forge python=3.11 \
+  napari pyqt numpy pandas scikit-image scipy tifffile nd2 openpyxl
+conda activate img-env
+conda install -c conda-forge micro_sam
+```
+
+### 3. Run the app
+
+```bash
+conda activate img-env
+cd ~/Desktop/spot-quant-main
+python -m spot_quant
+```
+
+Change the path if your folder is elsewhere. The first time you click **Segment cells**, micro-sam downloads a
+model (a few hundred MB), so that first run takes a minute.
+
 ## Panels
 
 **File IO**
@@ -30,7 +56,7 @@ across z → measure in every channel).
   <img src="detection_flowchart.svg" alt="Spot Quant detection pipeline" width="380">
 </p>
 
-## Smoothing
+### Smoothing
 
 Runs first, to stop random noise and hot pixels being read as spots. You pick the
 method and size; the preview updates live.
@@ -42,20 +68,20 @@ method and size; the preview updates live.
 
 ![Smoothing methods compared](smoothing_demo.png)
 
-## White top-hat
+### White top-hat
 
 Subtracts the uneven background glow, leaving spots on a flat field so one
 threshold works everywhere.
 
 ![Raw → smoothing → white top-hat](tophat_demo.png)
 
-## Linking across z-planes
+### Linking across z-planes
 
 A real spot appears on several planes as you focus through it. Linking joins its
 per-plane detections into one 3-D track, keeps the brightest (in-focus) plane, and
 measures there. A track seen on only one plane is treated as noise and dropped.
 
-## Cells: mother / bud (optional)
+### Cells: mother / bud (optional)
 
 Uses **micro-sam** to segment the yeast cells on the brightfield channel.
 **Segment cells (micro-sam)** finds the cells; **Auto: all ROIs** then tags each
@@ -63,3 +89,5 @@ ROI — the bigger cell is the mother, the smaller the bud (mother outlined cyan
 bud yellow, each labelled). With spots detected it also tags each dot (mom / bud /
 in-mom-toward-bud). Fix mistakes by hand with **Pick mom** / **Pick bud**,
 **Remove pick**, or by drawing a cell polygon. Needs the `micro_sam` package.
+
+
