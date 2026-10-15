@@ -73,7 +73,8 @@ reference spot's centroid and in-focus z, plus a per-axis **chromatic offset**
 
 - Transmitted / brightfield / phase channel → grayscale, **bottom** layer.
 - Fluorescence channels on top, additive; **reference** channel contrast
-  `[min, 0.7·max]`, others `[min, 0.8·max]`.
+  `[min, 0.3·max]`, others `[min, 0.4·max]` (display only — measurements read
+  the raw data).
 - White top-hat is **not** shown as a layer.
 - Preview outlines the thresholded masks inside un-analyzed ROIs; Detect shows
   each spot's measurement-region **disk outline** on its in-focus plane
@@ -110,7 +111,7 @@ reference spot's centroid and in-focus z, plus a per-axis **chromatic offset**
 
 ## 6. Testing
 
-~79 headless unit tests under `tests/` (see `tests/README.md`), covering
+146 headless unit tests under `tests/` (see `tests/README.md`), covering
 filters, the full stack pipeline, linking/in-focus/QC, ROI & session
 thresholds, reference-anchoring + offset, session compilation, the paired
 report, and the line-scan module. GUI/IO paths (napari layers, dialogs, file
@@ -123,7 +124,8 @@ runs without the GUI stack.
 
 ## 7. Known gotchas
 
-- **Google-Drive sync reverts**: the project folder is cloud-synced;
+- **Google-Drive sync reverts** (historical — the GitHub repo is now the
+  source of truth): the project folder was cloud-synced;
   `pipeline._filter_small` has reverted from `min_size=` to `max_size=`
   (an invalid kwarg for `skimage.remove_small_objects`) more than once after a
   sync conflict. If detection suddenly raises
@@ -133,3 +135,40 @@ runs without the GUI stack.
   histogram thresholds don't apply; its foreground is the probability map
   masked to the ROI.
 - **±2 rows** = 5 rows total (offsets −2…+2).
+
+---
+
+## 8. ROI shape, background and mom/bud
+
+### Tilted rectangles
+`is_axis_rect` still routes an upright box down the fast bounding-box path.
+Anything else — a rectangle turned with napari's rotation handle, a polygon, or
+a box dragged out of square — keeps its corners and is masked on its real
+outline. `is_rotated_rect` distinguishes a true turned rectangle from a
+deformed one; a deformed one is warned about, never rejected.
+
+### ROI-aware measurement
+`region_masks()` gives every ROI one mask, from its polygon or its rectangle.
+`_touches_boundary` tests the measurement disk against that mask rather than the
+bounding box, and `measure_spot(roi=...)` clips the background ring to it
+(falling back to the full ring under `MIN_RING_PIXELS`, with `bkg_pixels`
+recording what was used). Controlled by `PipelineParams.clip_bkg_to_roi`.
+
+### Mom / bud persistence
+`session_cells` maps filename → ROI label → at most two outline records
+(mother, bud), stored as polygon corners rather than a label image: a few
+hundred bytes per cell instead of megabytes per file, and small enough for the
+`cells` export sheet.
+
+* `outlines_for_roi` picks the pair — candidates ranked by **overlap inside the
+  ROI**, mother vs bud by total cell area, each needing
+  `min_cell_overlap_px` pixels inside. Both must qualify or nothing is stored.
+* `labels_from_session` rebuilds a file's label image on import, reusing the
+  stored cell ids so manual picks still line up.
+* `apply_roles` re-derives roles from spot **positions** after `run_session`,
+  never from `spot_id` — the global-threshold re-run can find a different set
+  of spots and renumber them.
+
+Roles reach the table as `spot_role`, `dist_to_bud_um`, `pair_type` and
+`role_note`; `build_report` keeps them as per-spot columns instead of pivoting
+them per channel.

@@ -18,8 +18,8 @@ import napari.utils.notifications as notifications
 import numpy as np
 from qtpy.QtCore import QTimer
 from qtpy.QtWidgets import (
-    QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QGroupBox, QHBoxLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from . import cells, pipeline
@@ -83,6 +83,11 @@ _PARAM_TIPS = {
     "bkg_width":
         "Thickness (px) of the background ring outside the gap. Its median "
         "(ignoring bright pixels) is the local background that gets subtracted.",
+    "clip_bkg":
+        "Take the background only from pixels inside the spot's own ROI, so a "
+        "spot near the edge of a small or tilted ROI can't read its background "
+        "from the cell next door. Ignored where clipping would leave too few "
+        "ring pixels to take a median over. Untick for the old behaviour.",
 }
 
 
@@ -115,6 +120,11 @@ class DetectionPanel(QWidget):
         self._oval_role = None
         # True while the "Add spot" tool is armed (click to place/remove a spot).
         self._add_spot_mode = False
+        # True while saved ROIs are being redrawn.  Adding a shape fires the
+        # layer's data event, and handling it mid-restore would re-save a
+        # partial ROI list -- which loses the remaining ROIs' stored labels and
+        # renumbers them.  See _restore_rois.
+        self._restoring = False
 
         layout = QVBoxLayout(self)
 
@@ -194,10 +204,12 @@ class DetectionPanel(QWidget):
         roi_layout = QVBoxLayout(roi_box)
         roi_layout.addWidget(QLabel(
             "Draw rectangles, or use 'Draw polygon ROI' for a custom shape.\n"
+            "To tilt a box, draw a rectangle then turn it with the rotation\n"
+            "handle under 'Select / delete ROI'. It stays a true rectangle and\n"
+            "is measured on its real tilted outline, not its upright box.\n"
             "A draw/select button stays on: keep drawing (or deleting) ROIs\n"
             "until you press Esc or click the button again. Detection happens\n"
-            "ONLY inside these ROIs; a rectangle reshaped into a non-rectangle\n"
-            "is rejected — redraw it or draw it as a polygon."))
+            "ONLY inside these ROIs."))
         roi_btn_row = QHBoxLayout()
         self.draw_btn = QPushButton("Draw ROI(s)")
         self.poly_btn = QPushButton("Draw polygon ROI")
@@ -259,6 +271,10 @@ class DetectionPanel(QWidget):
             self.bkg_gap, _PARAM_TIPS["bkg_gap"]))
         meas_form.addRow("Ring width", self._with_info(
             self.bkg_width, _PARAM_TIPS["bkg_width"]))
+        self.clip_bkg = QCheckBox("Keep the background ring inside the ROI")
+        self.clip_bkg.setChecked(self.params.clip_bkg_to_roi)
+        self.clip_bkg.setToolTip(_PARAM_TIPS["clip_bkg"])
+        meas_form.addRow(self.clip_bkg)
         layout.addWidget(meas_box)
 
         # Chromatic offset now lives in the Edit-metadata dialog (File IO).
@@ -318,12 +334,24 @@ class DetectionPanel(QWidget):
         self.toward_gap.setRange(0.0, 100.0)
         self.toward_gap.setDecimals(2)
         self.toward_gap.setSingleStep(0.05)
-        self.toward_gap.setValue(0.3)
+        self.toward_gap.setValue(self.params.toward_bud_gap_um)
         gap_form.addRow("Toward-bud gap (µm)", self._with_info(
             self.toward_gap,
             "When both dots are in the mother, one must be at least this many "
             "microns closer to the bud than the other to be tagged "
             "'toward bud'; otherwise both are just 'mom'."))
+        self.min_overlap = QSpinBox()
+        self.min_overlap.setRange(0, 100000)
+        self.min_overlap.setSingleStep(10)
+        self.min_overlap.setValue(self.params.min_cell_overlap_px)
+        gap_form.addRow("Min cell overlap (px)", self._with_info(
+            self.min_overlap,
+            "A cell counts as this ROI's mother or bud only if at least this "
+            "many of its pixels fall inside the ROI, so a sliver of a "
+            "neighbouring cell clipping the box is never mistaken for the bud. "
+            "An ROI is scored only when BOTH a mother and a bud qualify; with "
+            "one cell or none, its dots get no role. Counted in pixels, not "
+            "percent, because an ROI is usually smaller than a whole cell."))
         cell_layout.addLayout(gap_form)
         crow = QHBoxLayout()
         self.auto_all_btn = QPushButton("Auto: all ROIs")
@@ -369,6 +397,7 @@ class DetectionPanel(QWidget):
         self.min_distance.valueChanged.connect(self._on_param_changed)
         self.min_mask_size.valueChanged.connect(self._on_param_changed)
         self.min_link.valueChanged.connect(self._on_param_changed)
+        self.clip_bkg.toggled.connect(self._on_param_changed)
         self.thresh_method.currentTextChanged.connect(self._on_threshold_changed)
 
         self.state.image_loaded.connect(self._on_image_loaded)
@@ -428,7 +457,44 @@ class DetectionPanel(QWidget):
         if self.state.image is None:
             return
         self._restore_rois()
+        self._restore_cells()
         self._preview()
+
+    def _restore_cells(self):
+        """Rebuild this file's cell segmentation from the stored outlines.
+
+        An imported session brings back each ROI's mom/bud outlines, but not
+        the micro-sam label image they came from -- and that image is what the
+        viewer draws and what role assignment reads.  Rebuilding it here puts
+        the cells back on screen, already coloured, and makes Pick mom / Pick
+        bud and Auto work straight after an import without re-segmenting.
+        """
+        if self.state.current_path is None:
+            return
+        if self.state.cell_labels is not None:
+            return                       # a live segmentation wins
+        per_roi = self.state.session_cells.get(self.state.current_path.name)
+        if not per_roi:
+            return
+        try:
+            shape = self._plane_shape()
+        except Exception:  # noqa: BLE001
+            return
+        try:
+            labels, roles = cells.labels_from_session(per_roi, shape)
+        except Exception as exc:  # noqa: BLE001
+            notifications.show_warning(f"Could not restore cells: {exc}")
+            return
+        if not labels.any():
+            return
+        self.state.cell_labels = labels
+        self.state.cell_roles = roles
+        self._show_cells_layer()
+        self._recolor_cells()
+        n_mom = sum(1 for r in roles.values() if r == cells.MOM)
+        n_bud = sum(1 for r in roles.values() if r == cells.DAUGHTER)
+        notifications.show_info(
+            f"Restored {n_mom} mom and {n_bud} bud cell(s) from the session.")
 
     def _on_session_imported(self):
         """Sync controls to imported settings, then restore ROIs for the open
@@ -445,7 +511,8 @@ class DetectionPanel(QWidget):
                    self.thresh_method, self.min_mask_size, self.min_distance,
                    self.peak_rel, self.link_dist, self.min_link,
                    self.measure_radius, self.bkg_gap, self.bkg_width,
-                   self.ilastik_prob]
+                   self.ilastik_prob, self.clip_bkg, self.toward_gap,
+                   self.min_overlap]
         for w in widgets:
             w.blockSignals(True)
         try:
@@ -462,6 +529,11 @@ class DetectionPanel(QWidget):
             self.bkg_gap.setValue(int(p.bkg_gap))
             self.bkg_width.setValue(int(p.bkg_width))
             self.ilastik_prob.setValue(float(p.ilastik_prob_threshold))
+            self.clip_bkg.setChecked(bool(getattr(p, "clip_bkg_to_roi", True)))
+            self.toward_gap.setValue(
+                float(getattr(p, "toward_bud_gap_um", 0.3)))
+            self.min_overlap.setValue(
+                int(getattr(p, "min_cell_overlap_px", 50)))
         finally:
             for w in widgets:
                 w.blockSignals(False)
@@ -594,10 +666,12 @@ class DetectionPanel(QWidget):
         Returns a list of dicts:
           ``{"bounds": (r0,r1,c0,c1), "verts": ndarray|None, "valid": bool,
              "key": hashable}``
-        ``verts`` is ``None`` for a valid rectangle (bounding-box path); it is
-        the polygon corners for a polygon.  A shape drawn as a rectangle but no
-        longer axis-aligned is marked ``valid=False`` (corners kept for the
-        message).
+        ``verts`` is ``None`` only for an upright rectangle (the bounding-box
+        path); every other shape keeps its corners and is masked as a polygon.
+        A rectangle turned with napari's rotation handle is a true tilted
+        rectangle and is used exactly as drawn.  A box dragged out of square
+        still works, but is flagged ``deformed`` so the user gets a warning
+        instead of a rejection.
         """
         out = []
         if ROI_LAYER not in self.viewer.layers:
@@ -613,23 +687,38 @@ class DetectionPanel(QWidget):
             ys, xs = yx[:, 0], yx[:, 1]
             bounds = (int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max()))
             st = shape_types[i] if i < len(shape_types) else "polygon"
+            degenerate = (len(yx) < 3 or bounds[1] <= bounds[0]
+                          or bounds[3] <= bounds[2])
             if st == "rectangle" and pipeline.is_axis_rect(yx):
                 out.append({"bounds": bounds, "verts": None, "valid": True,
+                            "deformed": False,
                             "key": pipeline.shape_key(bounds, None)})
-            elif st == "rectangle":
-                # Rectangle-typed but reshaped: reject, don't silently box it.
-                out.append({"bounds": bounds, "verts": yx, "valid": False,
-                            "key": pipeline.shape_key(bounds, yx)})
-            else:
-                out.append({"bounds": bounds, "verts": yx, "valid": True,
-                            "key": pipeline.shape_key(bounds, yx)})
+                continue
+            # Everything else -- a rotated rectangle, a polygon, or a box
+            # dragged out of square -- is masked on its real outline rather
+            # than silently boxed or rejected.
+            out.append({"bounds": bounds, "verts": yx,
+                        "valid": not degenerate,
+                        "deformed": (st == "rectangle"
+                                     and not pipeline.is_rotated_rect(yx)),
+                        "key": pipeline.shape_key(bounds, yx)})
         return out
 
     def _valid_shapes(self):
         return [s for s in self._read_shapes() if s["valid"]]
 
     def _invalid_positions(self):
+        """1-based positions of shapes with no usable area (these block)."""
         return [i for i, s in enumerate(self._read_shapes(), 1) if not s["valid"]]
+
+    def _deformed_positions(self):
+        """1-based positions of boxes drawn as rectangles but no longer square.
+
+        They are still measured on their real outline; this only drives a
+        warning, so the user can straighten one that wasn't meant to be skewed.
+        """
+        return [i for i, s in enumerate(self._read_shapes(), 1)
+                if s.get("deformed")]
 
     def _analyzed_keys(self):
         return {e["key"] for e in self._analyzed}
@@ -708,6 +797,12 @@ class DetectionPanel(QWidget):
         Each ROI is added independently so one bad shape (e.g. an imported ROI
         with an off-image coordinate) can't silently wipe out all of them; any
         that fail are reported instead of swallowed.
+
+        Adding a shape fires the layer's ``data`` event.  Handling it here would
+        re-save a partial ROI list, so the ROIs not yet added would lose their
+        stored labels and be renumbered (importing ROI1-3 gave back ROI1, 4, 5)
+        -- and would re-run the preview once per shape.  The handler is muted
+        for the whole loop, and the state saved once at the end.
         """
         if self.state.current_path is None:
             return
@@ -727,6 +822,20 @@ class DetectionPanel(QWidget):
             name=ROI_LAYER, face_color="transparent", edge_color="yellow",
             edge_width=2)
         self._connect_roi_layer(layer)
+        self._restoring = True
+        try:
+            bad = self._add_saved_shapes(layer, saved, H, W)
+        finally:
+            self._restoring = False
+        # One save now that every shape is on the layer, so each ROI matches its
+        # stored record and keeps its original label.
+        self._save_rois()
+        if bad:
+            notifications.show_warning(
+                "Imported, but couldn't draw ROI(s): " + ", ".join(bad))
+
+    def _add_saved_shapes(self, layer, saved, H, W):
+        """Draw each saved ROI; return the labels that couldn't be drawn."""
         bad = []
         for rec in saved:
             try:
@@ -754,9 +863,7 @@ class DetectionPanel(QWidget):
                     layer.add(shp, shape_type="rectangle")
             except Exception:  # noqa: BLE001
                 bad.append(str(rec.get("label", "?")))
-        if bad:
-            notifications.show_warning(
-                "Imported, but couldn't draw ROI(s): " + ", ".join(bad))
+        return bad
 
     # ------------------------------------------------------------------ #
     def _collect_params(self):
@@ -773,6 +880,9 @@ class DetectionPanel(QWidget):
         self.params.measure_radius = self.measure_radius.value()
         self.params.bkg_gap = self.bkg_gap.value()
         self.params.bkg_width = self.bkg_width.value()
+        self.params.clip_bkg_to_roi = self.clip_bkg.isChecked()
+        self.params.toward_bud_gap_um = self.toward_gap.value()
+        self.params.min_cell_overlap_px = self.min_overlap.value()
         # Chromatic offset is edited in the metadata dialog and stored on state.
         self.params.offset_z = int(getattr(self.state, "offset_z", 0))
         self.params.offset_y = int(getattr(self.state, "offset_y", 0))
@@ -801,6 +911,11 @@ class DetectionPanel(QWidget):
 
     def _on_rois_changed(self, *args):
         """Handle ROI edits: purge deleted ROIs' data, then refresh preview."""
+        if self._restoring:
+            # Mid-restore the layer holds only part of the file's ROIs; acting
+            # on that would drop the rest and renumber them.  _restore_rois
+            # saves and previews once when it is done.
+            return
         current = {s["key"] for s in self._valid_shapes()}
         removed = [e for e in self._analyzed if e["key"] not in current]
         if removed:
@@ -822,17 +937,18 @@ class DetectionPanel(QWidget):
         self._collect_params()
         channel = self.channel_selector.currentIndex()
 
-        # Block on any rectangle that isn't actually rectangular.
+        # Only a shape with no area blocks now; a rotated or reshaped
+        # rectangle is measured on its real outline.
         invalid = self._invalid_positions()
         if invalid:
             self._clear_layer("spots (preview)")
             self.detect_btn.setEnabled(False)
             self.status_label.setText(
-                f"ROI shape(s) {invalid} aren't rectangles. Redraw them, or "
-                "use 'Draw polygon ROI'.")
+                f"ROI shape(s) {invalid} have no area. Redraw them.")
             self._reassert_draw_mode()
             return
         self.detect_btn.setEnabled(True)
+        deformed = self._deformed_positions()
 
         new_shapes = self._unanalyzed()
         self._update_pending()
@@ -882,10 +998,12 @@ class DetectionPanel(QWidget):
             flagged = self._apply_roi_warnings(counts)
             warn = (f"  |  ⚠ {flagged} ROI(s) ≠2 spots"
                     if flagged else "")
+            skew = (f"  |  \u26a0 ROI(s) {deformed} not square"
+                    if deformed else "")
             self.status_label.setText(
                 f"Preview: {len(result.centroids)} spot(s) in "
                 f"{len(new_shapes)} new ROI(s)  |  "
-                f"{self._format_thresholds(result.roi_thresholds)}{warn}")
+                f"{self._format_thresholds(result.roi_thresholds)}{warn}{skew}")
         except Exception as exc:  # noqa: BLE001
             notifications.show_error(f"Preview failed: {exc}")
         finally:
@@ -973,6 +1091,7 @@ class DetectionPanel(QWidget):
             for e in self._analyzed:
                 self._assign_roi(e)
             self._recolor_cells()
+            self._sync_cells_and_roles()
             self._annotate_spot_roles()
         self.state.session_changed.emit()
         self.state.result_updated.emit()
@@ -990,11 +1109,18 @@ class DetectionPanel(QWidget):
         invalid = self._invalid_positions()
         if invalid:
             notifications.show_warning(
-                f"ROI shape(s) {invalid} aren't rectangles. Redraw them or use "
-                "'Draw polygon ROI' before detecting.")
+                f"ROI shape(s) {invalid} have no area. Redraw them before "
+                "detecting.")
             self.status_label.setText(
                 f"Fix ROI shape(s) {invalid}, then Detect")
             return
+        deformed = self._deformed_positions()
+        if deformed:
+            notifications.show_warning(
+                f"ROI shape(s) {deformed} were drawn as rectangles but are no "
+                "longer square. They will be measured exactly as drawn. To "
+                "tilt a box without deforming it, turn it with the rotation "
+                "handle under 'Select / delete ROI'.")
         if not self._valid_shapes():
             notifications.show_warning("Draw at least one ROI before detecting.")
             self.status_label.setText("Draw an ROI, then Detect")
@@ -1063,6 +1189,12 @@ class DetectionPanel(QWidget):
             f"+{len(result.measurements)} measurements from {len(new_rois)} new "
             f"ROI(s); {len(self._analyzed)} analyzed total  |  "
             f"{ref}: {self._format_thresholds(ref_thr)}{warn}")
+        if self.state.cell_labels is not None:
+            for e in self._analyzed:
+                self._assign_roi(e)
+            self._recolor_cells()
+            self._sync_cells_and_roles()
+            self._annotate_spot_roles()
         self.state.result_updated.emit()
 
     def _register(self, result, new_items):
@@ -1221,6 +1353,7 @@ class DetectionPanel(QWidget):
                 entry["mom_cell" if role == "mom" else "daughter_cell"] = cell
                 self._assign_roi(entry)
         self._recolor_cells()
+        self._sync_cells_and_roles()
         self._annotate_spot_roles()
 
     def _remove_cell_pick(self, cell):
@@ -1351,6 +1484,7 @@ class DetectionPanel(QWidget):
         self._show_cells_layer()
         self._recolor_cells()
         self._annotate_spot_roles()
+        self._sync_cells_and_roles()
         if baked:
             notifications.show_info(f"Added {baked} {role} cell(s).")
 
@@ -1453,6 +1587,7 @@ class DetectionPanel(QWidget):
         if self.state.cell_labels is not None:
             self._assign_roi(entry)
             self._recolor_cells()
+            self._sync_cells_and_roles()
             self._annotate_spot_roles()
         self.state.result_updated.emit()
 
@@ -1482,6 +1617,50 @@ class DetectionPanel(QWidget):
             except Exception:  # noqa: BLE001
                 pass
 
+    def _record_cells_for_roi(self, entry):
+        """Save the outlines of this ROI's tagged mother and bud (at most two).
+
+        Outlines are small enough to hold for the whole session and to write
+        into the export, so mom/bud survives switching files, re-detection and
+        re-import.  Untagged cells overlapping the ROI are not stored.
+        """
+        if self.state.cell_labels is None or self.state.current_path is None:
+            return
+        mask = self._roi_mask_for(entry)
+        if mask is None:
+            return
+        recs = cells.outlines_for_roi(
+            self.state.cell_labels, mask, self.state.cell_roles,
+            mom_cell=entry.get("mom_cell"),
+            daughter_cell=entry.get("daughter_cell"),
+            min_overlap=int(self.params.min_cell_overlap_px))
+        per = self.state.session_cells.setdefault(
+            self.state.current_path.name, {})
+        if recs:
+            per[entry["label"]] = recs
+        else:
+            per.pop(entry["label"], None)
+
+    def _sync_cells_and_roles(self):
+        """Store every ROI's cells, then refresh mom/bud on the session table.
+
+        Called whenever a role changes so the Measurement tab shows the roles
+        straight away; the export recomputes them again from these same
+        outlines after its global-threshold re-run.
+        """
+        if self.state.current_path is None:
+            return
+        for e in self._analyzed:
+            self._record_cells_for_roi(e)
+        fname = self.state.current_path.name
+        per = self.state.session_records.get(fname)
+        if not per:
+            return
+        ref = self.channel_selector.currentText()
+        for region, df in list(per.items()):
+            per[region] = self.state.roles_for_file(fname, df, ref)
+        self.state.session_changed.emit()
+
     def _roi_mask_for(self, entry):
         if self.state.cell_labels is None:
             return None
@@ -1498,7 +1677,8 @@ class DetectionPanel(QWidget):
             daughter_cell=entry.get("daughter_cell"),
             mom_cell=entry.get("mom_cell"),
             pixel_size=float(self.state.meta.pixel_size or 1.0),
-            gap_um=float(self.toward_gap.value()))
+            gap_um=float(self.params.toward_bud_gap_um),
+            min_overlap=int(self.params.min_cell_overlap_px))
         if res["ok"]:
             entry["spot_roles"] = res["spot_roles"]
             if res["mom_cell"]:
@@ -1521,6 +1701,7 @@ class DetectionPanel(QWidget):
             else:
                 done += 1
         self._recolor_cells()
+        self._sync_cells_and_roles()
         self._annotate_spot_roles()
         notifications.show_info(
             f"mom/bud: {done} tagged, {need} both-in-mom (pick the bud to "
@@ -1531,7 +1712,8 @@ class DetectionPanel(QWidget):
         True if at least a mother cell was found."""
         labels = self.state.cell_labels
         mask = pipeline.roi_mask(bounds, verts, labels.shape)
-        mom, dau = cells.pair_by_size(labels, mask)
+        mom, dau = cells.pair_by_size(
+            labels, mask, min_overlap=int(self.params.min_cell_overlap_px))
         if mom:
             self.state.cell_roles[mom] = "mom"
         if dau:
@@ -1551,7 +1733,15 @@ class DetectionPanel(QWidget):
             notifications.show_warning(
                 "Draw at least one ROI (or detect spots) first.")
             return
-        n = sum(self._color_pair_by_size(s["bounds"], s["verts"]) for s in shapes)
+        labelled = self._save_rois()          # aligned with `shapes`
+        n = 0
+        for s, roi in zip(shapes, labelled):
+            if self._color_pair_by_size(s["bounds"], s["verts"]):
+                n += 1
+            # Keep the cells even with no spots yet, so the roles are ready as
+            # soon as detection runs.
+            self._record_cells_for_roi({"label": roi[4], "bounds": s["bounds"],
+                                        "verts": s["verts"]})
         self._recolor_cells()
         notifications.show_info(
             f"Coloured mom / bud cells in {n} ROI(s). "

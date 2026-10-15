@@ -68,8 +68,16 @@ class AppState(QObject):
         self.offset_x: int = 0
         # micro-sam cell segmentation for the current file: 2-D instance-label
         # image, and the mom/bud role of each cell label ({label: "mom"/"bud"}).
+        # Both are per-file and dropped when another file opens.
         self.cell_labels = None
         self.cell_roles: "dict[int, str]" = {}
+        # Session-wide cell record: filename -> ROI label -> list of
+        # {"cell", "role", "area", "verts"} for EVERY segmented cell touching
+        # that ROI.  Outlines rather than label images, so the whole session
+        # fits in memory and can be written to (and read back from) the export.
+        # This is what lets mom/bud survive switching files and the export
+        # re-run, which recomputes roles from these shapes.
+        self.session_cells: "dict[str, dict[str, list]]" = {}
 
     # -- per-file ROI persistence ------------------------------------------- #
     def assign_roi_labels(self, filename: str, shapes, ref_channel: str):
@@ -161,6 +169,16 @@ class AppState(QObject):
         if not files_data:
             return None, {}, None
         table, thresholds = pipeline.run_session(files_data, self.params)
+        # Re-derive mom/bud from each dot's position: the re-run may have found
+        # a different set of spots, so a role saved against a spot_id could
+        # land on the wrong dot.
+        from . import cells as cells_mod
+        table = cells_mod.apply_roles(
+            table, self.session_cells,
+            ref_by_file={f["filename"]: f["ref_channel"] for f in files_data},
+            pixel_by_file={f["filename"]: f.get("pixel_size", 1.0)
+                           for f in files_data},
+            gap_um=float(getattr(self.params, "toward_bud_gap_um", 0.3)))
         linescans = None
         if with_linescans:
             from . import scan
@@ -168,6 +186,15 @@ class AppState(QObject):
         return table, thresholds, linescans
 
     # -- session accumulation ----------------------------------------------- #
+    def roles_for_file(self, filename: str, df: pd.DataFrame,
+                       ref_channel: str) -> pd.DataFrame:
+        """Add the mom/bud columns to one file's freshly measured table."""
+        from . import cells as cells_mod
+        return cells_mod.apply_roles(
+            df, self.session_cells, ref_by_file={filename: ref_channel},
+            pixel_by_file={filename: self.meta.pixel_size},
+            gap_um=float(getattr(self.params, "toward_bud_gap_um", 0.3)))
+
     def record_measurements(self, filename: str, df: pd.DataFrame):
         """Add/replace the records for each region present in *df*."""
         tagged = pipeline.tag_filename(df, filename)
@@ -202,6 +229,7 @@ class AppState(QObject):
         self.session_rois = dict(data.get("session_rois", {}))
         self.session_polys = dict(data.get("session_polys", {}))
         self.session_ref = dict(data.get("session_ref", {}))
+        self.session_cells = dict(data.get("session_cells", {}))
         self.roi_counter = int(data.get("roi_counter", 0))
         params = data.get("params")
         if params is not None:
@@ -219,6 +247,7 @@ class AppState(QObject):
         self.session_shapes.clear()
         self.session_polys.clear()
         self.session_ref.clear()
+        self.session_cells.clear()
         self.roi_counter = 0
         self.session_changed.emit()
 

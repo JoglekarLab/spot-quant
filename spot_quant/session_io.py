@@ -27,12 +27,14 @@ import pandas as pd
 
 ROI_SHEET = "ROIs"
 SETTINGS_SHEET = "settings"
+CELLS_SHEET = "cells"
 
 # Detection-parameter fields persisted to the settings sheet.
 _PARAM_FLOAT = ("smoothing_size", "tophat_size", "peak_rel_threshold",
-                "link_max_dist", "ilastik_prob_threshold")
+                "link_max_dist", "ilastik_prob_threshold", "toward_bud_gap_um")
 _PARAM_INT = ("min_mask_size", "min_distance", "measure_radius", "bkg_gap",
-              "bkg_width", "min_link_planes", "offset_z", "offset_y", "offset_x")
+              "bkg_width", "min_link_planes", "offset_z", "offset_y", "offset_x",
+              "clip_bkg_to_roi", "min_cell_overlap_px")
 _PARAM_STR = ("smoothing_method", "threshold_method")
 
 
@@ -66,6 +68,53 @@ def rois_dataframe(session_shapes: dict, session_ref: dict) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=cols)
 
 
+def cells_dataframe(session_cells: dict) -> pd.DataFrame:
+    """One row per tagged cell, so at most two rows per ROI: mother and bud.
+
+    That pair is all a dividing cell needs, and it is enough to recompute the
+    roles after a re-run or to reopen a session without re-segmenting.
+    ``verts`` is the cell outline as JSON ``(row, col)`` pairs.
+    """
+    cols = ["filename", "region", "cell", "role", "area", "verts"]
+    rows = []
+    for fname, per_roi in (session_cells or {}).items():
+        for region, records in (per_roi or {}).items():
+            for rec in (records or []):
+                verts = rec.get("verts")
+                if verts is None:
+                    continue
+                rows.append({
+                    "filename": fname, "region": region,
+                    "cell": int(rec.get("cell", 0)),
+                    "role": rec.get("role", "") or "",
+                    "area": int(rec.get("area", 0)),
+                    "verts": json.dumps(np.asarray(verts).tolist()),
+                })
+    return pd.DataFrame(rows, columns=cols)
+
+
+def cells_from_sheet(cells_df: Optional[pd.DataFrame]) -> dict:
+    """Rebuild ``{filename: {region: [record, ...]}}`` from the cells sheet."""
+    out: dict = {}
+    if cells_df is None or cells_df.empty:
+        return out
+    for _, row in cells_df.iterrows():
+        raw = row.get("verts", "")
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            verts = np.asarray(json.loads(raw), dtype=float)
+        except Exception:  # noqa: BLE001
+            continue
+        rec = {"cell": _as_int(row.get("cell"), 0),
+               "role": (str(row.get("role", "")) if isinstance(
+                   row.get("role", ""), str) else ""),
+               "area": _as_int(row.get("area"), 0), "verts": verts}
+        out.setdefault(str(row["filename"]), {}).setdefault(
+            str(row["region"]), []).append(rec)
+    return out
+
+
 def settings_dataframe(params, roi_counter: int) -> pd.DataFrame:
     """Key/value table of detection parameters + the ROI-label counter."""
     rows = []
@@ -84,7 +133,8 @@ def settings_dataframe(params, roi_counter: int) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 def session_from_sheets(roi_df: Optional[pd.DataFrame],
                         settings_df: Optional[pd.DataFrame],
-                        params_factory) -> dict:
+                        params_factory,
+                        cells_df: Optional[pd.DataFrame] = None) -> dict:
     """Rebuild the session dicts + params from the two sheets.
 
     ``params_factory`` builds a params object from keyword arguments (pass
@@ -134,6 +184,7 @@ def session_from_sheets(roi_df: Optional[pd.DataFrame],
 
     return {"session_shapes": session_shapes, "session_rois": session_rois,
             "session_polys": session_polys, "session_ref": session_ref,
+            "session_cells": cells_from_sheet(cells_df),
             "roi_counter": roi_counter, "params": params, "approx": False}
 
 
@@ -200,7 +251,8 @@ def session_from_measurements(df: pd.DataFrame, pad: int = 12) -> dict:
     ``params=None`` and ``approx=True``.
     """
     empty = {"session_shapes": {}, "session_rois": {}, "session_polys": {},
-             "session_ref": {}, "roi_counter": 0, "params": None, "approx": True}
+             "session_ref": {}, "session_cells": {}, "roi_counter": 0,
+             "params": None, "approx": True}
     if df is None or df.empty:
         return empty
     pos = _find_pos_cols(df)
@@ -226,5 +278,5 @@ def session_from_measurements(df: pd.DataFrame, pad: int = 12) -> dict:
         session_shapes[str(fname)] = recs
         session_rois[str(fname)] = tuples
     return {"session_shapes": session_shapes, "session_rois": session_rois,
-            "session_polys": {}, "session_ref": {}, "roi_counter": roi_counter,
-            "params": None, "approx": True}
+            "session_polys": {}, "session_ref": {}, "session_cells": {},
+            "roi_counter": roi_counter, "params": None, "approx": True}

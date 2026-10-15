@@ -8,10 +8,11 @@ preview outlines and shows only the finalised detected spots (points,
 colour-coded by region). Changing any parameter or ROI returns to preview
 mode.
 
-Each ROI's threshold is computed from that ROI's **stack histogram** (top-hat
-pooled over all planes within the ROI). The calculated thresholds are shown in
-the status line, recorded per spot in a `roi_threshold` column, and exposed on
-the result.
+A **single** threshold is computed per channel from one histogram pooled over
+the top-hat pixels of **every** ROI (across all planes), then applied inside
+each ROI — so every region shares one cutoff. It is shown in the status line,
+recorded per spot in a `roi_threshold` column, and exposed on the result.
+(Earlier versions thresholded each ROI separately; they no longer do.)
 
 1. **Smoothing** — Gaussian, Median, Kuwahara, or Gaussian low-pass, with an
    editable filter size.

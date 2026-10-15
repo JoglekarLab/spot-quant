@@ -144,6 +144,8 @@ class MeasurementPanel(QWidget):
                                            self.state.session_ref)
         settings_df = session_io.settings_dataframe(
             self.state.params, getattr(self.state, "roi_counter", 0))
+        cells_df = session_io.cells_dataframe(
+            getattr(self.state, "session_cells", {}))
         companion = str(Path(path).with_suffix("")) + "_session.xlsx"
         try:
             if fmt == "xlsx":
@@ -155,6 +157,10 @@ class MeasurementPanel(QWidget):
                         settings_df.to_excel(
                             writer, sheet_name=session_io.SETTINGS_SHEET,
                             index=False)
+                    if not cells_df.empty:
+                        cells_df.to_excel(
+                            writer, sheet_name=session_io.CELLS_SHEET,
+                            index=False)
             else:
                 df.to_csv(path, index=False)
                 if not roi_df.empty:
@@ -164,6 +170,10 @@ class MeasurementPanel(QWidget):
                         settings_df.to_excel(
                             writer, sheet_name=session_io.SETTINGS_SHEET,
                             index=False)
+                        if not cells_df.empty:
+                            cells_df.to_excel(
+                                writer, sheet_name=session_io.CELLS_SHEET,
+                                index=False)
         except Exception as exc:  # noqa: BLE001
             notifications.show_error(f"Export failed: {exc}")
             return

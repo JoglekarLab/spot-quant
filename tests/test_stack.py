@@ -45,7 +45,8 @@ def test_measurement_columns(pipeline, spotty_stack):
     assert list(result.measurements.columns) == [
         "spot_id", "z_plane", "row_px", "col_px", "x_um", "y_um",
         "peak_intensity", "mean_intensity", "integrated_intensity",
-        "n_pixels", "bkg_median", "background", "corrected_integrated",
+        "n_pixels", "bkg_median", "bkg_pixels", "background",
+        "corrected_integrated",
         "region", "roi_threshold", "n_planes_linked"]
 
 

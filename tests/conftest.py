@@ -51,6 +51,36 @@ def pipeline():
     return load_module("pipeline")
 
 
+@pytest.fixture(scope="session")
+def cells():
+    return load_module("cells")
+
+
+@pytest.fixture(scope="session")
+def session_io():
+    return load_module("session_io")
+
+
+@pytest.fixture
+def budding_pair():
+    """A mother and bud as two overlapping disks in a label image.
+
+    Returns ``(labels, roi_mask, info)``; ``info`` carries the two cell ids,
+    their centres and a point deep inside the mother far from the bud.
+    """
+    H = W = 160
+    labels = np.zeros((H, W), dtype=np.int32)
+    yy, xx = np.ogrid[:H, :W]
+    mom_c, bud_c = (80, 60), (80, 118)
+    labels[(yy - mom_c[0]) ** 2 + (xx - mom_c[1]) ** 2 <= 34 ** 2] = 1
+    labels[((yy - bud_c[0]) ** 2 + (xx - bud_c[1]) ** 2 <= 20 ** 2)
+           & (labels == 0)] = 2
+    roi = np.zeros((H, W), dtype=bool)
+    roi[35:125, 15:150] = True
+    return labels, roi, {"mom": 1, "bud": 2,
+                         "mom_centre": mom_c, "bud_centre": bud_c}
+
+
 @pytest.fixture
 def spotty_image():
     """128x128 image: noisy background plus 3 bright Gaussian spots."""

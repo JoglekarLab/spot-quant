@@ -189,8 +189,12 @@ class FileIOPanel(QWidget):
                 settings_df = (xls.parse(session_io.SETTINGS_SHEET)
                                if session_io.SETTINGS_SHEET in xls.sheet_names
                                else None)
+                cells_df = (xls.parse(session_io.CELLS_SHEET)
+                            if session_io.CELLS_SHEET in xls.sheet_names
+                            else None)
                 return session_io.session_from_sheets(
-                    roi_df, settings_df, pipeline.PipelineParams), False
+                    roi_df, settings_df, pipeline.PipelineParams,
+                    cells_df), False
             df = xls.parse(xls.sheet_names[0])
             return session_io.session_from_measurements(df), True
         df = pd.read_csv(path)

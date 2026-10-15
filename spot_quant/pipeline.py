@@ -34,6 +34,10 @@ from . import filters
 
 THRESHOLD_METHODS = ("Otsu", "Li", "ilastik")
 
+# A clipped background ring smaller than this falls back to the full ring: too
+# few pixels and the median stops being a usable background estimate.
+MIN_RING_PIXELS = 8
+
 # An ROI is (row_min, row_max, col_min, col_max, label).
 ROI = Tuple[int, int, int, int, str]
 
@@ -95,6 +99,35 @@ def is_axis_rect(verts, tol: float = 1.0) -> bool:
     return True
 
 
+def is_rotated_rect(verts, angle_tol: float = 5.0,
+                    side_tol: float = 3.0) -> bool:
+    """True if four corners form a real rectangle at any rotation.
+
+    All four interior angles must be within ``angle_tol`` degrees of 90 and
+    opposite sides must match within ``side_tol`` pixels.  A rectangle turned
+    with napari's rotation handle passes; a box dragged into a trapezoid, or a
+    freehand four-click quadrilateral, fails.  Used only to warn -- a shape
+    that fails is still measured exactly as drawn.
+    """
+    v = np.asarray(verts, dtype=float)
+    if v.ndim != 2 or v.shape[0] != 4:
+        return False
+    v = v[:, -2:]
+    sides = []
+    for i in range(4):
+        a, b, c = v[i - 1], v[i], v[(i + 1) % 4]
+        u, w = a - b, c - b
+        nu, nw = float(np.linalg.norm(u)), float(np.linalg.norm(w))
+        if nu < 1e-9 or nw < 1e-9:
+            return False
+        ang = np.degrees(np.arccos(np.clip(np.dot(u, w) / (nu * nw), -1.0, 1.0)))
+        if abs(ang - 90.0) > angle_tol:
+            return False
+        sides.append(float(np.linalg.norm(v[(i + 1) % 4] - v[i])))
+    return (abs(sides[0] - sides[2]) <= side_tol
+            and abs(sides[1] - sides[3]) <= side_tol)
+
+
 @dataclass
 class PipelineParams:
     smoothing_method: str = "Median"
@@ -110,6 +143,16 @@ class PipelineParams:
     # Local background ring (pixels, measured from the disk edge outward)
     bkg_gap: int = 1                    # gap between spot disk and ring
     bkg_width: int = 3                  # ring thickness
+    # Keep the background ring inside the spot's own ROI, so it can't sample a
+    # neighbouring cell.  Falls back to the full ring if clipping leaves fewer
+    # than MIN_RING_PIXELS pixels.
+    clip_bkg_to_roi: bool = True
+    # Mom/bud: how much closer to the bud one dot must be, in microns, before
+    # it is called "toward_bud" rather than just "mom".
+    toward_bud_gap_um: float = 0.3
+    # A cell must have at least this many pixels inside an ROI to be called its
+    # mother or bud.  An ROI needs BOTH to be scored at all.
+    min_cell_overlap_px: int = 50
     # Cross-plane linking
     link_max_dist: float = 2.0          # max XY centroid distance to link
     min_link_planes: int = 3            # QC: drop tracks shorter than this
@@ -241,7 +284,8 @@ def _disk_ring_masks(shape, r, c, radius, gap, width):
 
 
 def measure_spot(raw: np.ndarray, foreground: np.ndarray, r: int, c: int,
-                 params: PipelineParams, full_disk: bool = False) -> dict:
+                 params: PipelineParams, full_disk: bool = False,
+                 roi: Optional[np.ndarray] = None) -> dict:
     """Intensity stats + local-ring background for one spot.
 
     Signal pixels are the thresholded foreground pixels within the spot disk;
@@ -254,11 +298,23 @@ def measure_spot(raw: np.ndarray, foreground: np.ndarray, r: int, c: int,
     Used for manually placed spots, which are typically ones detection missed
     because they sit below the threshold, so ``disk & foreground`` would be
     empty.
+
+    ``roi`` is the spot's own ROI mask.  When given (and
+    ``params.clip_bkg_to_roi`` is set) the background ring is clipped to it, so
+    a spot near the edge of a small or tilted ROI can't take its background
+    from a neighbouring cell.  Clipping is skipped when it would leave fewer
+    than ``MIN_RING_PIXELS`` pixels, since a median over a handful of pixels is
+    worse than a slightly leaky one.  ``bkg_pixels`` reports how many pixels the
+    median was actually taken over.
     """
     disk, ring = _disk_ring_masks(raw.shape, r, c, params.measure_radius,
                                   params.bkg_gap, params.bkg_width)
     signal_mask = disk if full_disk else (disk & foreground)
     bkg_mask = ring & ~foreground
+    if roi is not None and getattr(params, "clip_bkg_to_roi", True):
+        clipped = bkg_mask & roi
+        if int(clipped.sum()) >= MIN_RING_PIXELS:
+            bkg_mask = clipped
     spot_vals = raw[signal_mask]
     ring_vals = raw[bkg_mask]
     n_pixels = int(spot_vals.size)
@@ -271,6 +327,7 @@ def measure_spot(raw: np.ndarray, foreground: np.ndarray, r: int, c: int,
         "integrated_intensity": integrated,
         "n_pixels": n_pixels,
         "bkg_median": bkg_median,
+        "bkg_pixels": int(ring_vals.size),
         "background": background,
         "corrected_integrated": integrated - background,
     }
@@ -464,13 +521,48 @@ def _roi_bounds(label: str, rois: Optional[List[ROI]]):
     return None
 
 
-def _touches_boundary(r: int, c: int, radius: int, bounds) -> bool:
-    """True if a disk of *radius* at (r, c) reaches/exceeds the ROI bounds."""
+def _touches_boundary(r: int, c: int, radius: int, bounds,
+                      mask: Optional[np.ndarray] = None) -> bool:
+    """True if a disk of *radius* at (r, c) reaches outside its ROI.
+
+    With a *mask* the disk is tested against the ROI's real outline, which is
+    what matters for a polygon or a tilted box: their upright bounding box can
+    be twice the ROI's area, so a bounds-only test would let through spots
+    whose measurement disk hangs outside the ROI.  Falls back to *bounds* when
+    no mask is available (a plain upright rectangle).
+    """
+    if mask is not None:
+        h, w = mask.shape
+        ri, ci = int(round(r)), int(round(c))
+        r0, r1 = ri - radius, ri + radius + 1
+        c0, c1 = ci - radius, ci + radius + 1
+        if r0 < 0 or c0 < 0 or r1 > h or c1 > w:
+            return True
+        yy, xx = np.ogrid[r0:r1, c0:c1]
+        disk = (yy - ri) ** 2 + (xx - ci) ** 2 <= radius ** 2
+        return bool((disk & ~mask[r0:r1, c0:c1]).any())
     if bounds is None:
         return False
     r0, r1, c0, c1 = bounds
     return (r - radius < r0 or r + radius > r1
             or c - radius < c0 or c + radius > c1)
+
+
+def region_masks(rois: Optional[List[ROI]], masks: Optional[dict],
+                 plane_shape) -> dict:
+    """``{label: bool mask}`` for every ROI: its polygon, or its rectangle.
+
+    Gives boundary and background-ring checks one uniform view of each ROI's
+    real extent, whatever tool drew it.
+    """
+    out = {}
+    for roi in (rois or []):
+        label = roi[4]
+        if masks and label in masks:
+            out[label] = masks[label]
+        else:
+            out[label] = roi_mask(roi[:4], None, plane_shape)
+    return out
 
 
 def _roi_number(label: str) -> int:
@@ -550,7 +642,12 @@ def build_report(table: pd.DataFrame) -> pd.DataFrame:
         return table.reset_index(drop=True)
 
     channels = list(dict.fromkeys(table["channel"]))
-    val_cols = [c for c in table.columns if c not in id_cols + ["channel"]]
+    # Mom/bud describes the spot, not a channel, so these stay single columns
+    # instead of being repeated once per channel.
+    from .cells import ROLE_COLUMNS
+    role_cols = [c for c in ROLE_COLUMNS if c in table.columns]
+    val_cols = [c for c in table.columns
+                if c not in id_cols + ["channel"] + role_cols]
 
     wide = table.pivot_table(index=id_cols, columns="channel",
                              values=val_cols, aggfunc="first")
@@ -565,6 +662,11 @@ def build_report(table: pd.DataFrame) -> pd.DataFrame:
             if col in wide.columns:
                 ordered.append(col)
     wide = wide[[c for c in ordered if c in wide.columns]]
+
+    if role_cols:
+        roles = (table[id_cols + role_cols]
+                 .drop_duplicates(subset=id_cols, keep="first"))
+        wide = wide.merge(roles, on=id_cols, how="left")
 
     # Spots per ROI; abnormal (!= 2) reported last.
     grp = ["filename", "region"] if "filename" in wide.columns else ["region"]
@@ -636,6 +738,7 @@ def run_stack(stack: np.ndarray, params: PipelineParams,
     plane_shape = stack.shape[1:]
 
     tophat = _stack_tophat(stack, params)
+    rmasks = region_masks(rois, masks, plane_shape)
 
     # One global threshold (explicit, or pooled across all ROIs).
     if rois:
@@ -671,11 +774,13 @@ def run_stack(stack: np.ndarray, params: PipelineParams,
             continue
         z, r, c, _ = max(tr, key=lambda t: t[3])   # in-focus = max intensity
         region = _assign_region(r, c, rois, masks)
-        # Drop spots whose disk touches the boundary of their ROI.
+        rmask = rmasks.get(region)
+        # Drop spots whose disk reaches outside their ROI's real outline.
         if _touches_boundary(r, c, params.measure_radius,
-                             _roi_bounds(region, rois)):
+                             _roi_bounds(region, rois), rmask):
             continue
-        stats = measure_spot(stack[z], foreground[z], r, c, params)
+        stats = measure_spot(stack[z], foreground[z], r, c, params,
+                             roi=rmask)
         rows.append({
             "spot_id": sid,
             "z_plane": int(z),
@@ -694,7 +799,8 @@ def run_stack(stack: np.ndarray, params: PipelineParams,
     columns = ["spot_id", "z_plane", "row_px", "col_px",
                f"x_{pixel_unit}", f"y_{pixel_unit}",
                "peak_intensity", "mean_intensity", "integrated_intensity",
-               "n_pixels", "bkg_median", "background", "corrected_integrated",
+               "n_pixels", "bkg_median", "bkg_pixels", "background",
+               "corrected_integrated",
                "region", "roi_threshold", "n_planes_linked"]
     measurements = sort_by_roi(pd.DataFrame(rows, columns=columns))
     centroids = (np.array(centroids, dtype=float).reshape(-1, 3)
@@ -730,7 +836,8 @@ def _channel_foreground(stack: np.ndarray, params: PipelineParams,
 def _manual_measure(manual_spots: dict, ref_channel: str, ch_data: dict,
                     ch_thr: dict, params: PipelineParams,
                     pixel_size: float, pixel_unit: str,
-                    columns: list, start_id: int) -> pd.DataFrame:
+                    columns: list, start_id: int,
+                    rmasks: Optional[dict] = None) -> pd.DataFrame:
     """Measure user-placed spots across all channels (full-disk signal).
 
     ``manual_spots`` maps region label -> list of ``(row, col)``.  ``ch_data``
@@ -757,7 +864,8 @@ def _manual_measure(manual_spots: dict, ref_channel: str, ch_data: dict,
                     rr = int(np.clip(r + dy, 0, H - 1))
                     cc = int(np.clip(c + dx, 0, W - 1))
                 stats = measure_spot(stack[zz], fg[zz], rr, cc, params,
-                                     full_disk=True)
+                                     full_disk=True,
+                                     roi=(rmasks or {}).get(region))
                 rows.append({
                     "spot_id": sid, "channel": name,
                     "z_plane": zz, "row_px": rr, "col_px": cc,
@@ -819,6 +927,7 @@ def run_multichannel(stacks: dict, ref_channel: str, params: PipelineParams,
     ch_thr = {ref_channel: ref_res.roi_thresholds}
 
     dz, dy, dx = params.offset_z, params.offset_y, params.offset_x
+    rmasks = region_masks(rois, masks, ref_res.plane_shape)
     for name, stack in measurable.items():
         if name == ref_channel:
             continue
@@ -834,7 +943,8 @@ def run_multichannel(stacks: dict, ref_channel: str, params: PipelineParams,
             z = int(np.clip(int(rs["z_plane"]) + dz, 0, Z - 1))
             r = int(np.clip(int(rs["row_px"]) + dy, 0, H - 1))
             c = int(np.clip(int(rs["col_px"]) + dx, 0, W - 1))
-            stats = measure_spot(ch_stack[z], fg[z], r, c, params)
+            stats = measure_spot(ch_stack[z], fg[z], r, c, params,
+                                 roi=rmasks.get(rs["region"]))
             rows.append({
                 "spot_id": rs["spot_id"], "channel": name,
                 "z_plane": z, "row_px": r, "col_px": c,
@@ -852,7 +962,8 @@ def run_multichannel(stacks: dict, ref_channel: str, params: PipelineParams,
         start_id = (int(ref_res.measurements["spot_id"].max()) + 1
                     if len(ref_res.measurements) else 0)
         man = _manual_measure(manual_spots, ref_channel, ch_data, ch_thr,
-                              params, pixel_size, pixel_unit, columns, start_id)
+                              params, pixel_size, pixel_unit, columns, start_id,
+                              rmasks=rmasks)
         if len(man):
             frames.append(man)
 
