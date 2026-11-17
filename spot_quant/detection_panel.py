@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import napari.utils.notifications as notifications
 import numpy as np
+import pandas as pd
 from qtpy.QtCore import QTimer
 from qtpy.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
@@ -458,7 +459,52 @@ class DetectionPanel(QWidget):
             return
         self._restore_rois()
         self._restore_cells()
+        self._restore_detections()
         self._preview()
+
+    def _restore_detections(self):
+        """Redraw this file's saved spots when it is reopened.
+
+        Detection results live in the session table, but switching files
+        clears the on-screen spots.  Without this, a file analyzed earlier (or
+        by "Re-detect all files (global)") came back looking unanalyzed: its
+        ROIs fell back to the per-file live preview, and pressing Detect would
+        overwrite the saved (e.g. global-threshold) result.
+        """
+        if self.state.current_path is None:
+            return
+        fname = self.state.current_path.name
+        per = self.state.session_records.get(fname) or {}
+        frames = [df for df in per.values()
+                  if df is not None and not df.empty]
+        labels = self.state.analyzed_rois.get(fname)
+        if labels is None:                 # fall back to ROIs with records
+            labels = set()
+            for df in frames:
+                if "region" in df.columns:
+                    labels.update(str(r) for r in df["region"].unique())
+        if not labels:
+            return
+        recs = (pd.concat(frames, ignore_index=True) if frames
+                else pd.DataFrame(columns=["channel", "region", "z_plane",
+                                           "row_px", "col_px"]))
+        ref = (self.state.session_ref.get(fname)
+               or self.channel_selector.currentText())
+        try:
+            self._rebuild_analyzed_from_records(recs, ref, only_labels=labels)
+        except Exception as exc:  # noqa: BLE001
+            notifications.show_warning(f"Could not redraw saved spots: {exc}")
+            return
+        if self.state.cell_labels is not None:
+            for e in self._analyzed:
+                self._assign_roi(e)
+            self._recolor_cells()
+            self._sync_cells_and_roles()
+            self._annotate_spot_roles()
+        n_spots = sum(len(e["centroids"]) for e in self._analyzed)
+        self.status_label.setText(
+            f"Showing {n_spots} saved spot(s) in {len(self._analyzed)} "
+            "analyzed ROI(s)")
 
     def _restore_cells(self):
         """Rebuild this file's cell segmentation from the stored outlines.
@@ -1023,6 +1069,7 @@ class DetectionPanel(QWidget):
             self._reset_analysis()
             if fname:
                 self.state.session_records.pop(fname, None)
+                self.state.analyzed_rois.pop(fname, None)
                 self.state.session_changed.emit()
         self.detect()
         # Fold any manually placed spots back into the freshly re-run ROIs.
@@ -1032,8 +1079,12 @@ class DetectionPanel(QWidget):
                 if man.get(e["label"]):
                     self._remeasure_roi(e)
 
-    def _rebuild_analyzed_from_records(self, recs, ref):
-        """Rebuild the current file's analyzed ROIs from a measurement table."""
+    def _rebuild_analyzed_from_records(self, recs, ref, only_labels=None):
+        """Rebuild the current file's analyzed ROIs from a measurement table.
+
+        With *only_labels*, ROIs whose label is not in it are left unanalyzed
+        (drawn but never detected), so they still get the live preview.
+        """
         self._reset_analysis()
         labelled = self._save_rois()
         shapes = self._valid_shapes()
@@ -1041,6 +1092,8 @@ class DetectionPanel(QWidget):
                     if "channel" in recs.columns else recs)
         for s, roi in zip(shapes, labelled):
             label = roi[4]
+            if only_labels is not None and str(label) not in only_labels:
+                continue
             sub = ref_rows[ref_rows["region"] == label]
             pts = [(int(z), int(r), int(c)) for z, r, c in
                    zip(sub["z_plane"], sub["row_px"], sub["col_px"])]
@@ -1076,6 +1129,8 @@ class DetectionPanel(QWidget):
                 if "z_plane" in recs.columns and f.get("z_step"):
                     recs["z_um"] = recs["z_plane"] * f["z_step"]
                 self.state.session_records.pop(f["filename"], None)
+                self.state.mark_analyzed(
+                    f["filename"], [r[4] for r in f["rois"]], replace=True)
                 if not recs.empty:
                     self.state.record_measurements(f["filename"], recs)
                 if f["filename"] == cur:
@@ -1179,6 +1234,7 @@ class DetectionPanel(QWidget):
         fname = (self.state.current_path.name
                  if self.state.current_path else "unknown")
         self.state.record_measurements(fname, records)
+        self.state.mark_analyzed(fname, [roi[4] for roi in new_rois])
 
         self._save_rois()
         self._update_pending()

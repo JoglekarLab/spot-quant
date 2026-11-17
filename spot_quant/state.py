@@ -40,6 +40,11 @@ class AppState(QObject):
         # Keying by region lets incremental ROI detection add new regions and
         # re-detection replace a region without duplicating rows.
         self.session_records: "dict[str, dict[str, pd.DataFrame]]" = {}
+        # Labels of the ROIs that have been through detection, per file.  An
+        # ROI with zero spots has no rows in session_records, so this is what
+        # tells "analyzed, found nothing" apart from "drawn, not detected yet"
+        # when a file is reopened and its saved spots are redrawn.
+        self.analyzed_rois: "dict[str, set]" = {}
         # Manually placed spots, filename -> region label -> list of (row, col).
         # Measured full-disk and merged into detection at record/export time.
         self.manual_spots: "dict[str, dict[str, list]]" = {}
@@ -206,8 +211,17 @@ class AppState(QObject):
             per["_all"] = tagged
         self.session_changed.emit()
 
+    def mark_analyzed(self, filename: str, labels, replace: bool = False):
+        """Record that these ROI labels have been through detection."""
+        if replace:
+            self.analyzed_rois[filename] = {str(l) for l in labels}
+        else:
+            self.analyzed_rois.setdefault(filename, set()).update(
+                str(l) for l in labels)
+
     def remove_region(self, filename: str, region: str):
         """Drop a single ROI's records (e.g. when its ROI is deleted)."""
+        self.analyzed_rois.get(filename, set()).discard(str(region))
         per = self.session_records.get(filename)
         if not per or region not in per:
             return
@@ -242,6 +256,7 @@ class AppState(QObject):
 
     def clear_session(self):
         self.session_records.clear()
+        self.analyzed_rois.clear()
         self.manual_spots.clear()
         self.session_rois.clear()
         self.session_shapes.clear()
