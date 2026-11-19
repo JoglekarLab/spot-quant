@@ -7,7 +7,9 @@ export also carries two small tables:
 
 * an **ROIs** sheet — one row per ROI (rectangle or polygon), including empty
   ones, with its bounding box, polygon corners and reference channel;
-* a **settings** sheet — the detection parameters and the ROI-label counter.
+* a **settings** sheet — the detection parameters and the ROI-label counter;
+* a **spot_edits** sheet — spots the user added by hand or removed, so a
+  re-imported session keeps those edits.
 
 ``session_from_sheets`` rebuilds the session exactly from those two tables.
 ``session_from_measurements`` is the lossy fallback: it rebuilds an
@@ -28,6 +30,7 @@ import pandas as pd
 ROI_SHEET = "ROIs"
 SETTINGS_SHEET = "settings"
 CELLS_SHEET = "cells"
+SPOT_EDITS_SHEET = "spot_edits"
 
 # Detection-parameter fields persisted to the settings sheet.
 _PARAM_FLOAT = ("smoothing_size", "tophat_size", "peak_rel_threshold",
@@ -115,6 +118,41 @@ def cells_from_sheet(cells_df: Optional[pd.DataFrame]) -> dict:
     return out
 
 
+def spot_edits_dataframe(manual_spots: dict,
+                         removed_spots: dict) -> pd.DataFrame:
+    """One row per user edit: a spot added by hand or a detected spot removed.
+
+    ``edit`` is ``added`` or ``removed``; positions are image pixels.
+    """
+    cols = ["filename", "region", "edit", "row_px", "col_px"]
+    rows = []
+    for edit, src in (("added", manual_spots), ("removed", removed_spots)):
+        for fname, per in (src or {}).items():
+            for region, pts in (per or {}).items():
+                for r, c in (pts or []):
+                    rows.append({"filename": fname, "region": region,
+                                 "edit": edit, "row_px": int(r),
+                                 "col_px": int(c)})
+    return pd.DataFrame(rows, columns=cols)
+
+
+def spot_edits_from_sheet(df: Optional[pd.DataFrame]):
+    """Rebuild ``(manual_spots, removed_spots)`` from the spot_edits sheet."""
+    manual, removed = {}, {}
+    if df is None or df.empty:
+        return manual, removed
+    for _, row in df.iterrows():
+        edit = str(row.get("edit", "")).strip().lower()
+        target = (manual if edit == "added"
+                  else removed if edit == "removed" else None)
+        r, c = _as_int(row.get("row_px")), _as_int(row.get("col_px"))
+        if target is None or r is None or c is None:
+            continue
+        target.setdefault(str(row["filename"]), {}).setdefault(
+            str(row["region"]), []).append((r, c))
+    return manual, removed
+
+
 def settings_dataframe(params, roi_counter: int) -> pd.DataFrame:
     """Key/value table of detection parameters + the ROI-label counter."""
     rows = []
@@ -134,7 +172,8 @@ def settings_dataframe(params, roi_counter: int) -> pd.DataFrame:
 def session_from_sheets(roi_df: Optional[pd.DataFrame],
                         settings_df: Optional[pd.DataFrame],
                         params_factory,
-                        cells_df: Optional[pd.DataFrame] = None) -> dict:
+                        cells_df: Optional[pd.DataFrame] = None,
+                        edits_df: Optional[pd.DataFrame] = None) -> dict:
     """Rebuild the session dicts + params from the two sheets.
 
     ``params_factory`` builds a params object from keyword arguments (pass
@@ -182,9 +221,11 @@ def session_from_sheets(roi_df: Optional[pd.DataFrame],
         for rec in recs:
             roi_counter = max(roi_counter, _roi_number(rec["label"]))
 
+    manual, removed = spot_edits_from_sheet(edits_df)
     return {"session_shapes": session_shapes, "session_rois": session_rois,
             "session_polys": session_polys, "session_ref": session_ref,
             "session_cells": cells_from_sheet(cells_df),
+            "manual_spots": manual, "removed_spots": removed,
             "roi_counter": roi_counter, "params": params, "approx": False}
 
 

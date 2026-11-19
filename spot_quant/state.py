@@ -40,9 +40,27 @@ class AppState(QObject):
         # Keying by region lets incremental ROI detection add new regions and
         # re-detection replace a region without duplicating rows.
         self.session_records: "dict[str, dict[str, pd.DataFrame]]" = {}
+        # Labels of the ROIs that have been through detection, per file.  An
+        # ROI with zero spots has no rows in session_records, so this is what
+        # tells "analyzed, found nothing" apart from "drawn, not detected yet"
+        # when a file is reopened and its saved spots are redrawn.
+        self.analyzed_rois: "dict[str, set]" = {}
         # Manually placed spots, filename -> region label -> list of (row, col).
         # Measured full-disk and merged into detection at record/export time.
         self.manual_spots: "dict[str, dict[str, list]]" = {}
+        # Detected spots the user removed, filename -> region -> list of
+        # (row, col).  Every detection path (Detect, Re-detect, global, export)
+        # drops a detected spot that lands within pipeline.removal_radius of one.
+        self.removed_spots: "dict[str, dict[str, list]]" = {}
+        # Result of the last "Re-detect all files (global)".  While it is still
+        # current, Export uses the session table as is instead of re-running
+        # the whole session.  global_stale lists what changed since (shown in
+        # the export warning); an empty list means the result is current.
+        self.global_done: bool = False
+        self.global_thresholds: dict = {}
+        self.global_ref: "dict[str, str]" = {}
+        self.global_pixel: "dict[str, float]" = {}
+        self.global_stale: "list[str]" = []
         # Number of ROIs drawn on the current image but not yet analyzed.
         self.pending_rois: int = 0
         # Per-file ROIs as labelled tuples (r0,r1,c0,c1,label) + reference
@@ -95,9 +113,10 @@ class AppState(QObject):
         for rec in self.session_shapes.get(filename, []):
             prior[pipeline.shape_key(rec["bounds"], rec.get("verts"))] = \
                 rec["label"]
-        labelled, records = [], []
+        labelled, records, new_keys = [], [], set()
         for s in shapes:
             key = s.get("key") or pipeline.shape_key(s["bounds"], s.get("verts"))
+            new_keys.add(key)
             label = prior.get(key)
             if label is None:
                 self.roi_counter += 1
@@ -106,6 +125,8 @@ class AppState(QObject):
             labelled.append((r0, r1, c0, c1, label))
             records.append({"bounds": tuple(s["bounds"]),
                             "verts": s.get("verts"), "label": label})
+        if filename and new_keys != set(prior):
+            self.mark_global_stale(f"ROIs added, moved or deleted in {filename}")
         if records:
             self.session_rois[filename] = labelled
             self.session_shapes[filename] = records
@@ -151,6 +172,7 @@ class AppState(QObject):
                 "filename": fname, "stacks": stacks, "ref_channel": ref,
                 "rois": rois, "masks": masks or None,
                 "manual_spots": self.manual_spots.get(fname) or None,
+                "removed_spots": self.removed_spots.get(fname) or None,
                 "pixel_size": meta.pixel_size,
                 "pixel_unit": meta.pixel_unit,
                 "z_step": meta.z_step})
@@ -206,8 +228,64 @@ class AppState(QObject):
             per["_all"] = tagged
         self.session_changed.emit()
 
+    # -- global re-detect bookkeeping -------------------------------------- #
+    def set_global_result(self, thresholds: dict, ref_by_file: dict,
+                          pixel_by_file: dict):
+        """Remember that the session table now holds a global re-detect."""
+        self.global_done = True
+        self.global_thresholds = dict(thresholds or {})
+        self.global_ref = dict(ref_by_file or {})
+        self.global_pixel = dict(pixel_by_file or {})
+        self.global_stale = []
+
+    def mark_global_stale(self, reason: str):
+        """Note that something changed after the last global re-detect."""
+        if self.global_done and reason not in self.global_stale:
+            self.global_stale.append(reason)
+
+    def clear_global(self):
+        self.global_done = False
+        self.global_thresholds = {}
+        self.global_ref = {}
+        self.global_pixel = {}
+        self.global_stale = []
+
+    def table_without_rerun(self, with_linescans: bool = False):
+        """The session table as it stands (from the last global re-detect),
+        with mom/bud roles refreshed, for export without re-running detection.
+
+        Returns ``(table, linescans)``; line scans need the images, so they are
+        reloaded (no detection is re-run).
+        """
+        from . import cells as cells_mod
+        table = self.session_table()
+        if table.empty:
+            return table, None
+        ref_by_file = dict(self.global_ref)
+        ref_by_file.update({k: v for k, v in self.session_ref.items()
+                            if k not in ref_by_file})
+        table = cells_mod.apply_roles(
+            table, self.session_cells, ref_by_file=ref_by_file,
+            pixel_by_file=self.global_pixel,
+            gap_um=float(getattr(self.params, "toward_bud_gap_um", 0.3)))
+        linescans = None
+        if with_linescans:
+            from . import scan
+            files_data = self._build_files_data()
+            linescans = scan.linescans_from_measurements(files_data, table)
+        return table, linescans
+
+    def mark_analyzed(self, filename: str, labels, replace: bool = False):
+        """Record that these ROI labels have been through detection."""
+        if replace:
+            self.analyzed_rois[filename] = {str(l) for l in labels}
+        else:
+            self.analyzed_rois.setdefault(filename, set()).update(
+                str(l) for l in labels)
+
     def remove_region(self, filename: str, region: str):
         """Drop a single ROI's records (e.g. when its ROI is deleted)."""
+        self.analyzed_rois.get(filename, set()).discard(str(region))
         per = self.session_records.get(filename)
         if not per or region not in per:
             return
@@ -230,7 +308,11 @@ class AppState(QObject):
         self.session_polys = dict(data.get("session_polys", {}))
         self.session_ref = dict(data.get("session_ref", {}))
         self.session_cells = dict(data.get("session_cells", {}))
+        self.manual_spots = dict(data.get("manual_spots", {}))
+        self.removed_spots = dict(data.get("removed_spots", {}))
         self.roi_counter = int(data.get("roi_counter", 0))
+        # Measurements aren't imported, so there is no global result to reuse.
+        self.clear_global()
         params = data.get("params")
         if params is not None:
             self.params = params
@@ -242,7 +324,10 @@ class AppState(QObject):
 
     def clear_session(self):
         self.session_records.clear()
+        self.analyzed_rois.clear()
         self.manual_spots.clear()
+        self.removed_spots.clear()
+        self.clear_global()
         self.session_rois.clear()
         self.session_shapes.clear()
         self.session_polys.clear()

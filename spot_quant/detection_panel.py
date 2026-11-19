@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import napari.utils.notifications as notifications
 import numpy as np
+import pandas as pd
 from qtpy.QtCore import QTimer
 from qtpy.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
@@ -30,6 +31,7 @@ from .state import AppState
 ROI_LAYER = "local_ROI"
 CELLS_LAYER = "cells"
 OVAL_LAYER = "new cell"
+REMOVED_LAYER = "removed spots"
 # Distinct border colours cycled per region for spot annotation.
 _REGION_COLORS = ["red", "cyan", "yellow", "lime", "orange", "magenta"]
 
@@ -120,6 +122,9 @@ class DetectionPanel(QWidget):
         self._oval_role = None
         # True while the "Add spot" tool is armed (click to place/remove a spot).
         self._add_spot_mode = False
+        # True while the "Remove spot" tool is armed (click a spot to remove it,
+        # or click a removed spot's marker to bring it back).
+        self._remove_spot_mode = False
         # True while saved ROIs are being redrawn.  Adding a shape fires the
         # layer's data event, and handling it mid-restore would re-save a
         # partial ROI list -- which loses the remaining ROIs' stored labels and
@@ -303,17 +308,25 @@ class DetectionPanel(QWidget):
         layout.addWidget(self.status_label)
 
         # -- manual spot --------------------------------------------------- #
-        spot_box = QGroupBox("Manual spot")
+        spot_box = QGroupBox("Manual spots")
         spot_v = QVBoxLayout(spot_box)
         spot_v.addWidget(QLabel(
             "Detection missed a spot? Click 'Add spot', then click the middle "
-            "of\nwhere the spot should be, inside its ROI. Click an added spot "
-            "again\nto remove it. Added spots are measured (full disk) and "
-            "exported."))
+            "of\nwhere the spot should be, inside its ROI. Added spots are "
+            "measured\n(full disk).\nWrong spot? Click 'Remove spot', then "
+            "click the spot (detected or\nadded). A removed spot shows a "
+            "magenta ✕; click the ✕ to bring it\nback. Edits are kept when you "
+            "re-detect and saved in the export."))
+        spot_row = QHBoxLayout()
         self.add_spot_btn = QPushButton("Add spot")
         self.add_spot_btn.setCheckable(True)
         self.add_spot_btn.clicked.connect(self._toggle_add_spot)
-        spot_v.addWidget(self.add_spot_btn)
+        spot_row.addWidget(self.add_spot_btn)
+        self.remove_spot_btn = QPushButton("Remove spot")
+        self.remove_spot_btn.setCheckable(True)
+        self.remove_spot_btn.clicked.connect(self._toggle_remove_spot)
+        spot_row.addWidget(self.remove_spot_btn)
+        spot_v.addLayout(spot_row)
         layout.addWidget(spot_box)
 
         # -- 6. cells: mom / daughter via micro-sam ------------------------- #
@@ -400,6 +413,21 @@ class DetectionPanel(QWidget):
         self.clip_bkg.toggled.connect(self._on_param_changed)
         self.thresh_method.currentTextChanged.connect(self._on_threshold_changed)
 
+        # Any detection/measurement setting change also makes the result of a
+        # global re-detect out of date (export then warns before using it).
+        for w in (self.smooth_method, self.thresh_method,
+                  self.channel_selector):
+            w.currentIndexChanged.connect(self._mark_settings_stale)
+        for w in (self.smooth_size, self.tophat_size, self.ilastik_prob,
+                  self.peak_rel, self.min_distance, self.min_mask_size,
+                  self.min_link, self.link_dist, self.measure_radius,
+                  self.bkg_gap, self.bkg_width):
+            w.valueChanged.connect(self._mark_settings_stale)
+        self.clip_bkg.toggled.connect(self._mark_settings_stale)
+        self.state.metadata_changed.connect(
+            lambda *a: self.state.mark_global_stale(
+                "image metadata changed (pixel size or channel offsets)"))
+
         self.state.image_loaded.connect(self._on_image_loaded)
         self.state.metadata_changed.connect(self._on_param_changed)
         self.state.session_imported.connect(self._on_session_imported)
@@ -442,6 +470,8 @@ class DetectionPanel(QWidget):
         self.pick_remove_btn.setChecked(False)
         self._add_spot_mode = False
         self.add_spot_btn.setChecked(False)
+        self._remove_spot_mode = False
+        self.remove_spot_btn.setChecked(False)
         self._disarm_draw(commit=False)
         for n in (CELLS_LAYER, "mom cells", "bud cells", "spot roles",
                   "cell labels", OVAL_LAYER):
@@ -458,7 +488,52 @@ class DetectionPanel(QWidget):
             return
         self._restore_rois()
         self._restore_cells()
+        self._restore_detections()
         self._preview()
+
+    def _restore_detections(self):
+        """Redraw this file's saved spots when it is reopened.
+
+        Detection results live in the session table, but switching files
+        clears the on-screen spots.  Without this, a file analyzed earlier (or
+        by "Re-detect all files (global)") came back looking unanalyzed: its
+        ROIs fell back to the per-file live preview, and pressing Detect would
+        overwrite the saved (e.g. global-threshold) result.
+        """
+        if self.state.current_path is None:
+            return
+        fname = self.state.current_path.name
+        per = self.state.session_records.get(fname) or {}
+        frames = [df for df in per.values()
+                  if df is not None and not df.empty]
+        labels = self.state.analyzed_rois.get(fname)
+        if labels is None:                 # fall back to ROIs with records
+            labels = set()
+            for df in frames:
+                if "region" in df.columns:
+                    labels.update(str(r) for r in df["region"].unique())
+        if not labels:
+            return
+        recs = (pd.concat(frames, ignore_index=True) if frames
+                else pd.DataFrame(columns=["channel", "region", "z_plane",
+                                           "row_px", "col_px"]))
+        ref = (self.state.session_ref.get(fname)
+               or self.channel_selector.currentText())
+        try:
+            self._rebuild_analyzed_from_records(recs, ref, only_labels=labels)
+        except Exception as exc:  # noqa: BLE001
+            notifications.show_warning(f"Could not redraw saved spots: {exc}")
+            return
+        if self.state.cell_labels is not None:
+            for e in self._analyzed:
+                self._assign_roi(e)
+            self._recolor_cells()
+            self._sync_cells_and_roles()
+            self._annotate_spot_roles()
+        n_spots = sum(len(e["centroids"]) for e in self._analyzed)
+        self.status_label.setText(
+            f"Showing {n_spots} saved spot(s) in {len(self._analyzed)} "
+            "analyzed ROI(s)")
 
     def _restore_cells(self):
         """Rebuild this file's cell segmentation from the stored outlines.
@@ -550,11 +625,15 @@ class DetectionPanel(QWidget):
         self.state.pending_rois = 0
         self._draw_mode = None
         self._sync_mode_buttons()
-        for lyr in ("spots", "ROI labels", "spots (preview)"):
+        for lyr in ("spots", "ROI labels", "spots (preview)", REMOVED_LAYER):
             self._clear_layer(lyr)
 
     def _on_param_changed(self, *args):
         self._preview()
+
+    def _mark_settings_stale(self, *args):
+        self.state.mark_global_stale(
+            "detection or measurement settings changed")
 
     def _on_threshold_changed(self, method):
         self.ilastik_btn.setEnabled(method == "ilastik")
@@ -567,6 +646,7 @@ class DetectionPanel(QWidget):
             from pathlib import Path
             self.params.ilastik_model_path = Path(path)
             self.ilastik_label.setText(Path(path).name)
+            self._mark_settings_stale()
             self._on_param_changed()
 
     # -- ROI handling --------------------------------------------------- #
@@ -575,6 +655,7 @@ class DetectionPanel(QWidget):
         layer.events.data.connect(lambda e: self._on_rois_changed())
         layer.events.mode.connect(lambda e: self._on_roi_mode_changed())
         layer.mouse_drag_callbacks.append(self._on_add_spot_click)
+        layer.mouse_drag_callbacks.append(self._on_remove_spot_click)
 
     def _ensure_roi_layer(self):
         if ROI_LAYER not in self.viewer.layers:
@@ -1023,6 +1104,7 @@ class DetectionPanel(QWidget):
             self._reset_analysis()
             if fname:
                 self.state.session_records.pop(fname, None)
+                self.state.analyzed_rois.pop(fname, None)
                 self.state.session_changed.emit()
         self.detect()
         # Fold any manually placed spots back into the freshly re-run ROIs.
@@ -1032,8 +1114,12 @@ class DetectionPanel(QWidget):
                 if man.get(e["label"]):
                     self._remeasure_roi(e)
 
-    def _rebuild_analyzed_from_records(self, recs, ref):
-        """Rebuild the current file's analyzed ROIs from a measurement table."""
+    def _rebuild_analyzed_from_records(self, recs, ref, only_labels=None):
+        """Rebuild the current file's analyzed ROIs from a measurement table.
+
+        With *only_labels*, ROIs whose label is not in it are left unanalyzed
+        (drawn but never detected), so they still get the live preview.
+        """
         self._reset_analysis()
         labelled = self._save_rois()
         shapes = self._valid_shapes()
@@ -1041,6 +1127,8 @@ class DetectionPanel(QWidget):
                     if "channel" in recs.columns else recs)
         for s, roi in zip(shapes, labelled):
             label = roi[4]
+            if only_labels is not None and str(label) not in only_labels:
+                continue
             sub = ref_rows[ref_rows["region"] == label]
             pts = [(int(z), int(r), int(c)) for z, r, c in
                    zip(sub["z_plane"], sub["row_px"], sub["col_px"])]
@@ -1071,22 +1159,32 @@ class DetectionPanel(QWidget):
                     pixel_size=f.get("pixel_size", 1.0),
                     pixel_unit=f.get("pixel_unit", "px"),
                     rois=f["rois"], channel_thresholds=thresholds,
-                    masks=f.get("masks"), manual_spots=f.get("manual_spots"))
+                    masks=f.get("masks"), manual_spots=f.get("manual_spots"),
+                    removed_spots=f.get("removed_spots"))
                 recs = res.measurements.copy()
                 if "z_plane" in recs.columns and f.get("z_step"):
                     recs["z_um"] = recs["z_plane"] * f["z_step"]
                 self.state.session_records.pop(f["filename"], None)
+                self.state.mark_analyzed(
+                    f["filename"], [r[4] for r in f["rois"]], replace=True)
                 if not recs.empty:
                     self.state.record_measurements(f["filename"], recs)
                 if f["filename"] == cur:
                     self._rebuild_analyzed_from_records(recs, f["ref_channel"])
         except Exception as exc:  # noqa: BLE001
+            # Some files may already hold new results: don't reuse at export.
+            self.state.clear_global()
             notifications.show_error(f"Global re-detect failed: {exc}")
             return
         finally:
             self._running = False
             self.redetect_global_btn.setEnabled(True)
             self.redetect_global_btn.setText("Re-detect all files (global)")
+        self.state.set_global_result(
+            thresholds,
+            ref_by_file={f["filename"]: f["ref_channel"] for f in files_data},
+            pixel_by_file={f["filename"]: f.get("pixel_size", 1.0)
+                           for f in files_data})
         if self.state.cell_labels is not None:
             for e in self._analyzed:
                 self._assign_roi(e)
@@ -1163,7 +1261,10 @@ class DetectionPanel(QWidget):
                 stacks, ref, self.params,
                 pixel_size=self.state.meta.pixel_size,
                 pixel_unit=self.state.meta.pixel_unit, rois=new_rois,
-                threshold_rois=threshold_rois, masks=masks or None)
+                threshold_rois=threshold_rois, masks=masks or None,
+                removed_spots=(self.state.removed_spots.get(
+                    self.state.current_path.name)
+                    if self.state.current_path else None) or None)
             self._register(result, [(info[s["key"]]["roi"], s["verts"])
                                     for s in new_shapes])
         except Exception as exc:  # noqa: BLE001
@@ -1179,6 +1280,9 @@ class DetectionPanel(QWidget):
         fname = (self.state.current_path.name
                  if self.state.current_path else "unknown")
         self.state.record_measurements(fname, records)
+        self.state.mark_analyzed(fname, [roi[4] for roi in new_rois])
+        self.state.mark_global_stale(
+            f"Detect / Re-detect run on {fname} (that file's own threshold)")
 
         self._save_rois()
         self._update_pending()
@@ -1228,6 +1332,7 @@ class DetectionPanel(QWidget):
             self._spot_vol = None
             self._clear_layer("spots")
             self._clear_layer("ROI labels")
+            self._clear_layer(REMOVED_LAYER)
             self._reassert_draw_mode()
             return
         Z, H, W = self.state.channel_stack(
@@ -1249,6 +1354,7 @@ class DetectionPanel(QWidget):
         self._set_roi_labels([(*e["bounds"], e["label"])
                               for e in self._analyzed], counts_by_label)
         self._apply_roi_warnings(self._committed_counts())
+        self._show_removed_markers()
         self._reassert_draw_mode()
 
     # -- cells: micro-sam segmentation + mom / daughter ----------------- #
@@ -1492,6 +1598,8 @@ class DetectionPanel(QWidget):
     def _toggle_add_spot(self, *args):
         self._add_spot_mode = self.add_spot_btn.isChecked()
         if self._add_spot_mode:
+            self._remove_spot_mode = False
+            self.remove_spot_btn.setChecked(False)
             self._pick_mom = self._pick_daughter = self._pick_remove = False
             self.pick_mom_btn.setChecked(False)
             self.pick_dau_btn.setChecked(False)
@@ -1537,6 +1645,107 @@ class DetectionPanel(QWidget):
             self.state.manual_spots[fname].pop(region, None)
         self._remeasure_roi(entry)
 
+    def _toggle_remove_spot(self, *args):
+        self._remove_spot_mode = self.remove_spot_btn.isChecked()
+        if self._remove_spot_mode:
+            self._add_spot_mode = False
+            self.add_spot_btn.setChecked(False)
+            self._pick_mom = self._pick_daughter = self._pick_remove = False
+            self.pick_mom_btn.setChecked(False)
+            self.pick_dau_btn.setChecked(False)
+            self.pick_remove_btn.setChecked(False)
+            self._disarm_draw()
+            self._stop_draw_mode()
+            self._sync_mode_buttons()
+            if ROI_LAYER in self.viewer.layers:
+                try:
+                    self.viewer.layers.selection.active = self.viewer.layers[ROI_LAYER]
+                    self.viewer.layers[ROI_LAYER].mode = "pan_zoom"
+                except Exception:  # noqa: BLE001
+                    pass
+            notifications.show_info(
+                "Click the centre of a spot to remove it. Click a removed "
+                "spot's ✕ to bring it back.")
+        else:
+            self._restore_roi_active()
+
+    def _on_remove_spot_click(self, layer, event):
+        """Remove the clicked spot, or bring back a removed one.
+
+        In order: a spot the user added is simply taken out again; a removed
+        spot's ✕ is brought back; otherwise the nearest detected spot is
+        remembered as removed, so re-detection won't find it again.
+        """
+        if not self._remove_spot_mode:
+            return
+        rc = self._click_rc(layer, event)
+        if rc is None:
+            return
+        r, c = rc
+        entry = self._entry_at_point(r, c)
+        if entry is None:
+            notifications.show_info("Click a spot inside an analyzed ROI.")
+            return
+        region = entry["label"]
+        fname = (self.state.current_path.name
+                 if self.state.current_path else "unknown")
+        rad = pipeline.removal_radius(self.params)
+
+        def nearest(pts):
+            best, best_d = None, None
+            for i, (pr, pc) in enumerate(pts):
+                d = (pr - r) ** 2 + (pc - c) ** 2
+                if d <= rad * rad and (best_d is None or d < best_d):
+                    best, best_d = i, d
+            return best
+
+        manual = self.state.manual_spots.get(fname, {})
+        removed = self.state.removed_spots.setdefault(fname, {})
+        i = nearest(manual.get(region, []))
+        if i is not None:                            # an added spot
+            manual[region].pop(i)
+            if not manual[region]:
+                manual.pop(region, None)
+            msg = "Added spot removed."
+        else:
+            i = nearest(removed.get(region, []))
+            if i is not None:                        # a removed spot's marker
+                removed[region].pop(i)
+                msg = "Spot brought back."
+            else:                                    # a detected spot
+                cents = [(int(cr), int(cc))
+                         for _, cr, cc in entry["centroids"]]
+                i = nearest(cents)
+                if i is None:
+                    if not removed:
+                        self.state.removed_spots.pop(fname, None)
+                    notifications.show_info(
+                        "No spot there. Click closer to a spot's centre.")
+                    return
+                removed.setdefault(region, []).append(cents[i])
+                msg = "Spot removed."
+        if not removed.get(region):
+            removed.pop(region, None)
+        if not removed:
+            self.state.removed_spots.pop(fname, None)
+        self._remeasure_roi(entry)
+        notifications.show_info(msg)
+
+    def _show_removed_markers(self):
+        """Mark each removed spot of the open file with a magenta ✕."""
+        self._clear_layer(REMOVED_LAYER)
+        if self.state.current_path is None:
+            return
+        per = self.state.removed_spots.get(self.state.current_path.name) or {}
+        shown = {e["label"] for e in self._analyzed}
+        pts = [[r, c] for region, lst in per.items() if region in shown
+               for r, c in lst]
+        if not pts:
+            return
+        self.viewer.add_points(
+            np.array(pts, dtype=float), name=REMOVED_LAYER, size=7,
+            symbol="x", face_color="magenta", border_color="magenta")
+
     def _remeasure_roi(self, entry):
         """Re-run one ROI including its manual spots; update display + table."""
         ref = self.channel_selector.currentText()
@@ -1555,6 +1764,12 @@ class DetectionPanel(QWidget):
                  if self.state.current_path else "unknown")
         region_manual = self.state.manual_spots.get(fname, {}).get(label)
         manual = {label: region_manual} if region_manual else None
+        region_removed = self.state.removed_spots.get(fname, {}).get(label)
+        removed = {label: region_removed} if region_removed else None
+        # After a global re-detect, keep using its thresholds so an edited ROI
+        # stays comparable with the rest of the session.
+        global_thr = ((self.state.global_thresholds or None)
+                      if self.state.global_done else None)
         self._running = True
         try:
             result = pipeline.run_multichannel(
@@ -1562,7 +1777,8 @@ class DetectionPanel(QWidget):
                 pixel_size=self.state.meta.pixel_size,
                 pixel_unit=self.state.meta.pixel_unit,
                 rois=[roi], threshold_rois=threshold_rois, masks=masks or None,
-                manual_spots=manual)
+                channel_thresholds=global_thr, manual_spots=manual,
+                removed_spots=removed)
         except Exception as exc:  # noqa: BLE001
             notifications.show_error(f"Re-measure failed: {exc}")
             return
@@ -1577,6 +1793,8 @@ class DetectionPanel(QWidget):
         entry["centroids"] = np.array(pts, dtype=int).reshape(-1, 3)
 
         self.state.remove_region(fname, label)
+        # remove_region also forgets the ROI as analyzed; it still is.
+        self.state.mark_analyzed(fname, [label])
         records = recs.copy()
         if not records.empty:
             if "z_plane" in records.columns:
@@ -1589,6 +1807,8 @@ class DetectionPanel(QWidget):
             self._recolor_cells()
             self._sync_cells_and_roles()
             self._annotate_spot_roles()
+        if self._add_spot_mode or self._remove_spot_mode:
+            self._restore_roi_active()    # keep clicks landing on the ROI layer
         self.state.result_updated.emit()
 
     def _restore_roi_active(self):

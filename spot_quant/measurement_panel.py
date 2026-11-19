@@ -25,6 +25,7 @@ class MeasurementPanel(QWidget):
     def __init__(self, state: AppState):
         super().__init__()
         self.state = state
+        self._export_cancelled = False
 
         layout = QVBoxLayout(self)
 
@@ -89,12 +90,53 @@ class MeasurementPanel(QWidget):
                 self.table.setItem(r, c, QTableWidgetItem(text))
         self.table.resizeColumnsToContents()
 
+    def _export_global_result(self, with_linescans):
+        """Export the last global re-detect as it stands, without re-running.
+
+        If something changed after it (new/moved/deleted ROIs, settings, a
+        per-file Detect), warn and let the user export anyway or cancel.
+        """
+        stale = list(self.state.global_stale)
+        if stale:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("Results may be out of date")
+            box.setText("These changed after the last "
+                        "'Re-detect all files (global)':")
+            box.setInformativeText(
+                "\n".join(f"• {s}" for s in stale)
+                + "\n\nExport will use the results as they are now, without "
+                "re-running. To update them first, click Cancel and run "
+                "'Re-detect all files (global)' again.")
+            export_btn = box.addButton("Export anyway", QMessageBox.AcceptRole)
+            box.addButton(QMessageBox.Cancel)
+            box.exec_()
+            if box.clickedButton() is not export_btn:
+                self._export_cancelled = True
+                return None, None
+        try:
+            df, linescans = self.state.table_without_rerun(
+                with_linescans=with_linescans)
+        except Exception as exc:  # noqa: BLE001
+            notifications.show_error(f"Export failed: {exc}")
+            self._export_cancelled = True
+            return None, None
+        notifications.show_info(
+            "Using the results from 'Re-detect all files (global)' "
+            "(no re-run).")
+        return df, linescans
+
     def _recompute_or_fallback(self, with_linescans):
         """Re-run the session with a global threshold; fall back to the
         incrementally recorded table if a re-run isn't possible.
 
+        If "Re-detect all files (global)" was already run, its result is
+        exported as is (see :meth:`_export_global_result`).
+
         Returns ``(dataframe, linescans_or_None)``.
         """
+        if self.state.global_done:
+            return self._export_global_result(with_linescans)
         n_rois = sum(len(b) for b in self.state.session_rois.values())
         if n_rois:
             n_files = len([b for b in self.state.session_rois.values() if b])
@@ -104,6 +146,7 @@ class MeasurementPanel(QWidget):
                 "using one global threshold pooled from all ROIs, then export?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
             if reply != QMessageBox.Yes:
+                self._export_cancelled = True
                 return None, None
             try:
                 df, thresholds, linescans = self.state.recompute_session(
@@ -123,7 +166,10 @@ class MeasurementPanel(QWidget):
         do_linescan = self.linescan_check.isChecked()
         # Re-run the whole session so the threshold is global across every ROI
         # of every file, then export that result.
+        self._export_cancelled = False
         df, linescans = self._recompute_or_fallback(with_linescans=do_linescan)
+        if self._export_cancelled:
+            return
         if df is None or df.empty:
             notifications.show_warning("No measurements to export.")
             return
@@ -146,6 +192,8 @@ class MeasurementPanel(QWidget):
             self.state.params, getattr(self.state, "roi_counter", 0))
         cells_df = session_io.cells_dataframe(
             getattr(self.state, "session_cells", {}))
+        edits_df = session_io.spot_edits_dataframe(
+            self.state.manual_spots, self.state.removed_spots)
         companion = str(Path(path).with_suffix("")) + "_session.xlsx"
         try:
             if fmt == "xlsx":
@@ -161,6 +209,10 @@ class MeasurementPanel(QWidget):
                         cells_df.to_excel(
                             writer, sheet_name=session_io.CELLS_SHEET,
                             index=False)
+                    if not edits_df.empty:
+                        edits_df.to_excel(
+                            writer, sheet_name=session_io.SPOT_EDITS_SHEET,
+                            index=False)
             else:
                 df.to_csv(path, index=False)
                 if not roi_df.empty:
@@ -173,6 +225,11 @@ class MeasurementPanel(QWidget):
                         if not cells_df.empty:
                             cells_df.to_excel(
                                 writer, sheet_name=session_io.CELLS_SHEET,
+                                index=False)
+                        if not edits_df.empty:
+                            edits_df.to_excel(
+                                writer,
+                                sheet_name=session_io.SPOT_EDITS_SHEET,
                                 index=False)
         except Exception as exc:  # noqa: BLE001
             notifications.show_error(f"Export failed: {exc}")

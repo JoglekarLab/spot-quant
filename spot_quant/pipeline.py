@@ -880,13 +880,56 @@ def _manual_measure(manual_spots: dict, ref_channel: str, ch_data: dict,
     return pd.DataFrame(rows, columns=columns)
 
 
+def removal_radius(params: PipelineParams) -> int:
+    """How close (px) a click or a removed point must be to a spot to match it.
+
+    Used both when the user clicks a spot to remove it and when a later
+    re-detection decides whether a newly found spot is one the user removed
+    (its centre can shift by a pixel or two with new settings).
+    """
+    return max(int(params.measure_radius), 3)
+
+
+def _near_any(r: float, c: float, pts, radius: float) -> bool:
+    return any((float(pr) - r) ** 2 + (float(pc) - c) ** 2 <= radius * radius
+               for pr, pc in pts)
+
+
+def drop_removed_spots(df: pd.DataFrame, removed: Optional[dict],
+                       radius: float) -> pd.DataFrame:
+    """Drop detected spots the user removed.
+
+    ``removed`` maps region label -> list of ``(row, col)``.  A row is dropped
+    when it lies within *radius* px of a removed point of its own region.
+    """
+    if not removed or df is None or df.empty or "region" not in df.columns:
+        return df
+    keep = [not _near_any(float(r["row_px"]), float(r["col_px"]),
+                          removed.get(str(r["region"]), ()), radius)
+            for _, r in df.iterrows()]
+    return df[np.asarray(keep, dtype=bool)].reset_index(drop=True)
+
+
+def drop_removed_centroids(centroids: np.ndarray, removed: Optional[dict],
+                           radius: float) -> np.ndarray:
+    """Same as :func:`drop_removed_spots` for an ``(N, 3)`` z/row/col array."""
+    cents = np.asarray(centroids)
+    if not removed or cents.size == 0:
+        return cents
+    pts = [p for region_pts in removed.values() for p in region_pts]
+    keep = [not _near_any(float(row[-2]), float(row[-1]), pts, radius)
+            for row in cents]
+    return cents[np.asarray(keep, dtype=bool)]
+
+
 def run_multichannel(stacks: dict, ref_channel: str, params: PipelineParams,
                      pixel_size: float = 1.0, pixel_unit: str = "px",
                      rois: Optional[List[ROI]] = None,
                      threshold_rois: Optional[List[ROI]] = None,
                      channel_thresholds: Optional[dict] = None,
                      masks: Optional[dict] = None,
-                     manual_spots: Optional[dict] = None
+                     manual_spots: Optional[dict] = None,
+                     removed_spots: Optional[dict] = None
                      ) -> MultiChannelResult:
     """Detect spots in the reference channel only; measure all channels there.
 
@@ -898,6 +941,11 @@ def run_multichannel(stacks: dict, ref_channel: str, params: PipelineParams,
     is added to correct chromatic aberration.  Each channel still goes through
     smoothing, white top-hat and ROI stack-histogram thresholding so the masked
     disk + ring measurement uses that channel's own foreground.
+
+    ``removed_spots`` (region label -> list of ``(row, col)``) are detected
+    spots the user removed; any reference spot within :func:`removal_radius`
+    of one is dropped before the other channels are measured.  User-added
+    ``manual_spots`` are never dropped.
     """
     measurable = {n: s for n, s in stacks.items() if is_measurable_channel(n)}
     if not measurable:
@@ -911,7 +959,10 @@ def run_multichannel(stacks: dict, ref_channel: str, params: PipelineParams,
     ref_res = run_stack(measurable[ref_channel], params,
                         pixel_size, pixel_unit, rois, threshold_rois,
                         threshold=ref_thresh, masks=masks)
-    ref_df = ref_res.measurements.copy()
+    rad = removal_radius(params)
+    ref_meas = drop_removed_spots(ref_res.measurements, removed_spots, rad)
+    ref_cents = drop_removed_centroids(ref_res.centroids, removed_spots, rad)
+    ref_df = ref_meas.copy()
     ref_df.insert(1, "channel", ref_channel)
     columns = list(ref_df.columns)
 
@@ -939,7 +990,7 @@ def run_multichannel(stacks: dict, ref_channel: str, params: PipelineParams,
         ch_thr[name] = thr
         Z, H, W = ch_stack.shape
         rows = []
-        for _, rs in ref_res.measurements.iterrows():
+        for _, rs in ref_meas.iterrows():
             z = int(np.clip(int(rs["z_plane"]) + dz, 0, Z - 1))
             r = int(np.clip(int(rs["row_px"]) + dy, 0, H - 1))
             c = int(np.clip(int(rs["col_px"]) + dx, 0, W - 1))
@@ -971,7 +1022,7 @@ def run_multichannel(stacks: dict, ref_channel: str, params: PipelineParams,
                            extra=["channel", "spot_id"])
     return MultiChannelResult(
         measurements=combined, per_channel=per_channel,
-        centroids=ref_res.centroids, tophat=ref_res.tophat,
+        centroids=ref_cents, tophat=ref_res.tophat,
         foreground=ref_res.foreground, plane_shape=ref_res.plane_shape,
         n_planes=ref_res.n_planes, roi_thresholds=thresholds)
 
@@ -1028,7 +1079,8 @@ def run_session(files_data: list, params: PipelineParams):
             pixel_size=f.get("pixel_size", 1.0),
             pixel_unit=f.get("pixel_unit", "px"),
             rois=f["rois"], channel_thresholds=thresholds,
-            masks=f.get("masks"), manual_spots=f.get("manual_spots"))
+            masks=f.get("masks"), manual_spots=f.get("manual_spots"),
+            removed_spots=f.get("removed_spots"))
         frames.append(tag_filename(res.measurements, f["filename"]))
     if not frames:
         return pd.DataFrame(), thresholds
